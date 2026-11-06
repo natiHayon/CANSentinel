@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CANSentinel</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">CAN<span>Sentinel</span></div>
+  <div class="badges">
+    <span class="badge safe" title="This UI never opens a CAN interface and never transmits.">READ-ONLY &middot; offline</span>
+    <span id="logStatus" class="badge muted">no log loaded</span>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="log">Log</button>
+  <button class="tab" data-tab="live">Live</button>
+  <button class="tab" data-tab="find">Find control</button>
+  <button class="tab" data-tab="speed">Speed</button>
+  <button class="tab" data-tab="gear">Gear</button>
+  <button class="tab" data-tab="checksum">Counter &amp; checksum</button>
+  <button class="tab" data-tab="profile">Profile</button>
+  <button class="tab" data-tab="replay">Replay</button>
+</nav>
+
+<main>
+  <!-- LOG -->
+  <section class="panel active" id="tab-log">
+    <h1>Load a CAN log</h1>
+    <p class="lede">Any recorded log: webCAN CSV, candump, generic <span class="mono">epoch;id;data</span>,
+      or the JSON capture format. Auto-detected, RX frames only. The file is read on your machine and never leaves it.</p>
+    <div class="row">
+      <input type="file" id="logFile">
+      <button id="logBtn" class="primary">Load log</button>
+    </div>
+    <div id="logErr" class="err"></div>
+    <div id="logInfo" class="info" hidden></div>
+    <div id="logMeta" class="metacard" hidden></div>
+    <div id="idTableWrap" class="tablewrap"></div>
+  </section>
+
+  <!-- LIVE -->
+  <section class="panel" id="tab-live">
+    <h1>Live capture <span class="badge safe" style="vertical-align:middle">listen-only</span></h1>
+    <p class="lede">Connect to your CAN reader, watch live traffic, and record a capture that <b>loads straight into the analysis</b> &mdash; no download-then-upload. It still saves a named file (e.g. <span class="mono">LandRover_Defender_2026_Unlock_x4.json</span>) in <span class="mono">caps/</span>. Read-only: listen-only by default, nothing is transmitted.</p>
+    <div class="grid">
+      <label>Reader
+        <select id="lvDriver">
+          <option value="simulator">Simulator (no hardware)</option>
+          <option value="usb_can_fd">Waveshare USB-CAN-FD</option>
+          <option value="usb_can_a">Waveshare USB-CAN-A</option>
+          <option value="pythoncan">python-can</option>
+          <option value="marathon">Marathon CAN-USB</option>
+        </select>
+      </label>
+      <label>Bitrate
+        <select id="lvBitrate">
+          <option value="500000">500 kbit/s</option>
+          <option value="250000">250 kbit/s</option>
+          <option value="1000000">1 Mbit/s</option>
+          <option value="125000">125 kbit/s</option>
+        </select>
+      </label>
+      <label>Channel <span class="hint">adapter ch</span>
+        <input id="lvChannel" type="number" value="1" min="0">
+      </label>
+      <label class="check"><input id="lvListen" type="checkbox" checked> Listen-only (safe)</label>
+    </div>
+    <div class="row">
+      <button id="lvConnect" class="primary">Connect</button>
+      <button id="lvDisconnect">Disconnect</button>
+      <span id="lvStatus" class="badge muted">not connected</span>
+    </div>
+    <div id="lvErr" class="err"></div>
+
+    <div id="lvSim" hidden>
+      <h2 class="sub">Simulator actions <span class="hint">generate traffic to record</span></h2>
+      <div class="row">
+        <button class="lvsim" data-ev="unlock">Unlock</button>
+        <button class="lvsim" data-ev="lock">Lock</button>
+        <button class="lvsim" data-ev="brake">Brake</button>
+        <button class="lvsim" data-ev="horn">Horn</button>
+        <button class="lvsim" data-ev="event">Generic event</button>
+      </div>
+    </div>
+
+    <h2 class="sub">Record</h2>
+    <div class="grid">
+      <label>Make <input id="rvMake" type="text" placeholder="Land Rover"></label>
+      <label>Model <input id="rvModel" type="text" placeholder="Defender"></label>
+      <label>Year <input id="rvYear" type="text" placeholder="2026"></label>
+      <label>Action <input id="rvAction" type="text" placeholder="Unlock"></label>
+      <label>Count <span class="hint">times</span><input id="rvCount" type="number" min="1" placeholder="4"></label>
+    </div>
+    <div class="row">
+      <button id="rvStart" class="primary">&#9679; Start recording</button>
+      <button id="rvStop" hidden>&#9632; Stop &amp; load</button>
+      <span id="rvState" class="hint"></span>
+    </div>
+    <div id="rvDone" class="info" hidden></div>
+
+    <h2 class="sub">Live monitor</h2>
+    <div id="lvMon" class="tablewrap"><p class="hint">Connect to see live frames.</p></div>
+  </section>
+
+  <!-- FIND -->
+  <section class="panel" id="tab-find">
+    <h1>Find a control</h1>
+    <p class="lede">Recover the CAN ID / byte / bit behind a button, lock or switch. Tell it how many times
+      you triggered the action; it ranks the fields that changed that many times and rejects machine-cadence
+      chatter (rolling counters, periodic status words).</p>
+    <div id="findMeta" class="findhint" hidden></div>
+    <div class="grid">
+      <label>Events (how many times)
+        <input id="fEvents" type="number" min="1" placeholder="e.g. 4">
+      </label>
+      <label>Encoding
+        <select id="fMode">
+          <option value="auto">auto (try all)</option>
+          <option value="pulse">pulse bit (button)</option>
+          <option value="toggle">toggle bit (lock/gear)</option>
+          <option value="value">value byte (wheel/console)</option>
+        </select>
+      </label>
+      <label>Only these IDs <span class="hint">optional</span>
+        <input id="fOnly" type="text" placeholder="0x340,0x2E2">
+      </label>
+      <label>Baseline <span class="hint">optional quiet log</span>
+        <input id="fBaseline" type="file">
+      </label>
+    </div>
+    <details class="explainer">
+      <summary>Which encoding? pulse vs toggle vs value &mdash; it changes what you recover</summary>
+      <div class="exbody">
+        <p>The same action is encoded differently depending on the control. Pick the wrong mode and the real field gets buried under look-alikes.</p>
+        <ul>
+          <li><b class="k-pulse">pulse bit</b> &mdash; a button that springs back: the bit goes 0&rarr;1&rarr;0 for the moment you hold it. Momentary push-buttons (lock/unlock button, rear-defrost, steering-wheel keys). Counted as <i>rising edges</i>.</li>
+          <li><b class="k-toggle">toggle bit</b> &mdash; a state that stays: one bit flips and holds between two states. Things that latch: lock <i>state</i>, gear in P, a switch left on. Counted as <i>state changes</i>.</li>
+          <li><b class="k-value">value byte</b> &mdash; many buttons on one message: a shared byte sits at an idle value and takes a distinct code per button (steering-wheel / console clusters). Counted as <i>bursts</i>; each code is listed.</li>
+          <li><b class="k-auto">auto</b> &mdash; tries all three and ranks them together. Start here, then narrow to one mode if the right field is buried.</li>
+        </ul>
+        <p class="extip"><b>Your hunt:</b> rear-defrost &ldquo;on/off/on/off&rdquo; is two signals &mdash; the <b class="k-pulse">button press</b> is a pulse (4 rising edges), while the defrost <b class="k-toggle">state</b> it sets is a toggle. Pulse finds the button; toggle finds the status bit.</p>
+      </div>
+    </details>
+    <fieldset class="cadence">
+      <legend>Human-cadence filter</legend>
+      <div class="grid">
+        <label>min-gap (s) <span class="hint">faster &rarr; machine</span>
+          <input id="fMinGap" type="number" step="0.05" value="0.30">
+        </label>
+        <label>settle-gap (s) <span class="hint">fully human</span>
+          <input id="fSettle" type="number" step="0.1" value="1.0">
+        </label>
+        <label class="check">
+          <input id="fDrop" type="checkbox"> drop implausibly fast candidates
+        </label>
+      </div>
+    </fieldset>
+    <button id="findBtn" class="primary">Find</button>
+    <div id="findErr" class="err"></div>
+    <div id="findOut" class="tablewrap"></div>
+  </section>
+
+  <!-- SPEED / CONTINUOUS -->
+  <section class="panel" id="tab-speed">
+    <h1>Find a continuous signal <span class="sim" style="background:var(--accent);color:#06121f">GATE</span></h1>
+    <p class="lede">The immobilizer's <b>standstill gate is vehicle speed</b> &mdash; a smooth multi-byte number, not a button, so the button finder can't see it. Drive a known maneuver during the capture (roll <b>0 &rarr; up &rarr; 0</b>), load it here, and this ranks the fields that move smoothly over a real range and trace that up-and-down path. Rolling counters and checksums are rejected.</p>
+    <div class="row">
+      <label class="inline">Only these IDs <span class="hint">optional</span>
+        <input id="cOnly" type="text" placeholder="0x1A0,0x3E9">
+      </label>
+      <button id="contBtn" class="primary">Find continuous</button>
+    </div>
+    <div id="contErr" class="err"></div>
+    <div id="contOut" class="tablewrap"></div>
+    <p class="hint">For an exact scale/offset fit, run the CLI with a reference value trace:
+      <span class="mono">python find_continuous.py --trace yourlog --reference gps_speed.txt</span></p>
+  </section>
+
+  <!-- GEAR -->
+  <section class="panel" id="tab-gear">
+    <h1>Find the gear selector <span class="sim" style="background:var(--good);color:#03130f">GATE</span></h1>
+    <p class="lede">The other standstill gate is <b>gear in P/N</b>. Gear is a small <b>held</b> bit-field (a nibble) &mdash; not a button and not a whole byte &mdash; so it needs its own search. Shift through the gears during the capture (<b>P &rarr; R &rarr; N &rarr; D &rarr; &hellip;</b>), tell it how many positions you used, and it finds the latched sub-field that holds that many stable levels.</p>
+    <div class="row">
+      <label>Positions <span class="hint">how many gears</span>
+        <input id="gPos" type="number" min="2" placeholder="e.g. 4">
+      </label>
+      <label class="inline">Only these IDs <span class="hint">optional</span>
+        <input id="gOnly" type="text" placeholder="0x3C0">
+      </label>
+      <button id="gearBtn" class="primary">Find gear</button>
+    </div>
+    <div id="gearErr" class="err"></div>
+    <div id="gearOut" class="tablewrap"></div>
+    <p class="hint">The held codes are the gear values &mdash; identify which one is <b>Park</b>, then add the field to a profile as the gear gate.</p>
+  </section>
+
+  <!-- CHECKSUM -->
+  <section class="panel" id="tab-checksum">
+    <h1>Rolling counter &amp; checksum</h1>
+    <p class="lede">Find the rolling counter and crack the checksum so transmitted frames would be ECU-accepted.
+      Leave the ID blank to scan every ID in the log.</p>
+    <div class="row">
+      <label class="inline">CAN ID <span class="hint">optional</span>
+        <input id="chkId" type="text" placeholder="0x340">
+      </label>
+      <button id="chkBtn" class="primary">Analyze</button>
+    </div>
+    <div id="chkErr" class="err"></div>
+    <div id="chkOut" class="tablewrap"></div>
+  </section>
+
+  <!-- PROFILE -->
+  <section class="panel" id="tab-profile">
+    <h1>Vehicle profile</h1>
+    <p class="lede">Define a platform profile and validate it against the loaded log. Gate signals
+      (speed, gear) must validate before a data inhibit is ever allowed &mdash; a failing gate is disqualifying.</p>
+    <div class="row">
+      <button id="profExBtn">Load example profile</button>
+      <button id="profValBtn" class="primary">Validate against log</button>
+    </div>
+    <textarea id="profJson" class="code" spellcheck="false" placeholder="Paste or build a profile JSON here, or click &quot;Load example profile&quot;."></textarea>
+    <div id="profErr" class="err"></div>
+    <div id="profVerdict" class="verdict" hidden></div>
+    <div id="profOut" class="tablewrap"></div>
+  </section>
+
+  <!-- REPLAY -->
+  <section class="panel" id="tab-replay">
+    <h1>Replay &amp; immobilizer <span class="sim">SIMULATION</span></h1>
+    <p class="lede">Decode the loaded log into a vehicle-state timeline, and optionally run the immobilizer
+      state machine over it. This is a pure replay &mdash; no CAN interface is opened and nothing is transmitted.
+      The decode profile uses <span class="mono">maps_to</span> signals (distinct from the validate profile).</p>
+    <div class="row">
+      <button id="repExBtn">Load example decode profile</button>
+      <label class="inline">Code sequence <span class="hint">comma-separated</span>
+        <input id="repCode" type="text" placeholder="LOCK,LOCK,VOLUP">
+      </label>
+      <label class="check"><input id="repImmo" type="checkbox" checked> run immobilizer</label>
+      <button id="repBtn" class="primary">Run replay</button>
+    </div>
+    <textarea id="repJson" class="code" spellcheck="false" placeholder="Decode profile JSON, or click &quot;Load example decode profile&quot;."></textarea>
+    <div id="repErr" class="err"></div>
+    <div id="repOut"></div>
+  </section>
+</main>
+
+<footer class="foot">
+  CANSentinel &middot; anti-theft CAN toolkit &middot; analysis is read-only, the immobilizer acts only at confirmed standstill and fails open.
+</footer>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
