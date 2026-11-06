@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CANSentinel</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">CAN<span>Sentinel</span></div>
+  <div class="badges">
+    <span class="badge safe" title="This UI never opens a CAN interface and never transmits.">READ-ONLY &middot; offline</span>
+    <span id="logStatus" class="badge muted">no log loaded</span>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="log">Log</button>
+  <button class="tab" data-tab="find">Find control</button>
+  <button class="tab" data-tab="checksum">Counter &amp; checksum</button>
+  <button class="tab" data-tab="profile">Profile</button>
+  <button class="tab" data-tab="replay">Replay</button>
+</nav>
+
+<main>
+  <!-- LOG -->
+  <section class="panel active" id="tab-log">
+    <h1>Load a CAN log</h1>
+    <p class="lede">Any recorded log: webCAN CSV, candump, generic <span class="mono">epoch;id;data</span>,
+      or the JSON capture format. Auto-detected, RX frames only. The file is read on your machine and never leaves it.</p>
+    <div class="row">
+      <input type="file" id="logFile">
+      <button id="logBtn" class="primary">Load log</button>
+    </div>
+    <div id="logErr" class="err"></div>
+    <div id="logInfo" class="info" hidden></div>
+    <div id="idTableWrap" class="tablewrap"></div>
+  </section>
+
+  <!-- FIND -->
+  <section class="panel" id="tab-find">
+    <h1>Find a control</h1>
+    <p class="lede">Recover the CAN ID / byte / bit behind a button, lock or switch. Tell it how many times
+      you triggered the action; it ranks the fields that changed that many times and rejects machine-cadence
+      chatter (rolling counters, periodic status words).</p>
+    <div class="grid">
+      <label>Events (how many times)
+        <input id="fEvents" type="number" min="1" placeholder="e.g. 4">
+      </label>
+      <label>Encoding
+        <select id="fMode">
+          <option value="auto">auto (try all)</option>
+          <option value="pulse">pulse bit (button)</option>
+          <option value="toggle">toggle bit (lock/gear)</option>
+          <option value="value">value byte (wheel/console)</option>
+        </select>
+      </label>
+      <label>Only these IDs <span class="hint">optional</span>
+        <input id="fOnly" type="text" placeholder="0x340,0x2E2">
+      </label>
+      <label>Baseline <span class="hint">optional quiet log</span>
+        <input id="fBaseline" type="file">
+      </label>
+    </div>
+    <fieldset class="cadence">
+      <legend>Human-cadence filter</legend>
+      <div class="grid">
+        <label>min-gap (s) <span class="hint">faster &rarr; machine</span>
+          <input id="fMinGap" type="number" step="0.05" value="0.30">
+        </label>
+        <label>settle-gap (s) <span class="hint">fully human</span>
+          <input id="fSettle" type="number" step="0.1" value="1.0">
+        </label>
+        <label class="check">
+          <input id="fDrop" type="checkbox"> drop implausibly fast candidates
+        </label>
+      </div>
+    </fieldset>
+    <button id="findBtn" class="primary">Find</button>
+    <div id="findErr" class="err"></div>
+    <div id="findOut" class="tablewrap"></div>
+  </section>
+
+  <!-- CHECKSUM -->
+  <section class="panel" id="tab-checksum">
+    <h1>Rolling counter &amp; checksum</h1>
+    <p class="lede">Find the rolling counter and crack the checksum so transmitted frames would be ECU-accepted.
+      Leave the ID blank to scan every ID in the log.</p>
+    <div class="row">
+      <label class="inline">CAN ID <span class="hint">optional</span>
+        <input id="chkId" type="text" placeholder="0x340">
+      </label>
+      <button id="chkBtn" class="primary">Analyze</button>
+    </div>
+    <div id="chkErr" class="err"></div>
+    <div id="chkOut" class="tablewrap"></div>
+  </section>
+
+  <!-- PROFILE -->
+  <section class="panel" id="tab-profile">
+    <h1>Vehicle profile</h1>
+    <p class="lede">Define a platform profile and validate it against the loaded log. Gate signals
+      (speed, gear) must validate before a data inhibit is ever allowed &mdash; a failing gate is disqualifying.</p>
+    <div class="row">
+      <button id="profExBtn">Load example profile</button>
+      <button id="profValBtn" class="primary">Validate against log</button>
+    </div>
+    <textarea id="profJson" class="code" spellcheck="false" placeholder="Paste or build a profile JSON here, or click &quot;Load example profile&quot;."></textarea>
+    <div id="profErr" class="err"></div>
+    <div id="profVerdict" class="verdict" hidden></div>
+    <div id="profOut" class="tablewrap"></div>
+  </section>
+
+  <!-- REPLAY -->
+  <section class="panel" id="tab-replay">
+    <h1>Replay &amp; immobilizer <span class="sim">SIMULATION</span></h1>
+    <p class="lede">Decode the loaded log into a vehicle-state timeline, and optionally run the immobilizer
+      state machine over it. This is a pure replay &mdash; no CAN interface is opened and nothing is transmitted.
+      The decode profile uses <span class="mono">maps_to</span> signals (distinct from the validate profile).</p>
+    <div class="row">
+      <button id="repExBtn">Load example decode profile</button>
+      <label class="inline">Code sequence <span class="hint">comma-separated</span>
+        <input id="repCode" type="text" placeholder="LOCK,LOCK,VOLUP">
+      </label>
+      <label class="check"><input id="repImmo" type="checkbox" checked> run immobilizer</label>
+      <button id="repBtn" class="primary">Run replay</button>
+    </div>
+    <textarea id="repJson" class="code" spellcheck="false" placeholder="Decode profile JSON, or click &quot;Load example decode profile&quot;."></textarea>
+    <div id="repErr" class="err"></div>
+    <div id="repOut"></div>
+  </section>
+</main>
+
+<footer class="foot">
+  CANSentinel &middot; anti-theft CAN toolkit &middot; analysis is read-only, the immobilizer acts only at confirmed standstill and fails open.
+</footer>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
