@@ -46,8 +46,8 @@ Supported log formats (auto-detected)
   * webCAN / CANsub CSV  (TimestampEpoch;BusChannel;ID;...;DataBytes)
   * candump (Linux SocketCAN):   (1700000000.123456) can0 123#DEADBEEF
   * generic delimited:   <epoch><sep><id-hex><sep><data-hex>   (sep = ; , or space)
-  * JSON capture:        {"frames":[{"ts":..,"id":..,"data":[..],"dir":"rx"}, ...]}
-                         (or a bare list of such frame objects; RX frames only)
+  * JSON capture:        {"frames":[{ts|timestamp, id|id_hex, data|data_hex}, ...]}
+                         (also a bare list, or JSON-lines; RX frames only)
 
 Examples
 --------
@@ -124,18 +124,94 @@ def load_log(path: str) -> list[Frame]:
     return frames
 
 
-def _load_json(raw: str, path: str = "<json>") -> list[Frame]:
-    """Load a JSON capture (e.g. the project's timed CAN reader).
+def _json_ts(r: dict) -> float | None:
+    for k in ("ts", "timestamp", "source_timestamp", "time"):
+        v = r.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return None
 
-    Accepts a dict with a "frames" list, or a bare list of frame objects. Each
-    frame gives an epoch timestamp, an arbitration ID and a data payload under
-    common key spellings (``ts``/``source_timestamp``, ``id``/``id_hex``,
-    ``data`` int-list / ``data_hex``). Only receive frames are kept: transmit
-    echoes (``dir`` of tx/out/1) and remote-request frames (``rtr``) are
-    dropped, so the loader stays read-only-safe and consistent with the webCAN
-    loader. Any metadata outside "frames" (make/model/presses) is ignored here.
+
+def _json_id(r: dict) -> int | None:
+    for k in ("id", "can_id", "arbitration_id", "id_hex"):
+        v = r.get(k)
+        if v is None or isinstance(v, bool):
+            continue
+        if isinstance(v, int):
+            return v
+        s = str(v).strip()
+        if not s:
+            continue
+        # id_hex or an "0x.." string is hex; a bare string may be decimal or hex
+        try:
+            return int(s, 16) if (k == "id_hex" or s.lower().startswith("0x")) \
+                else int(s, 0)
+        except ValueError:
+            try:
+                return int(s, 16)
+            except ValueError:
+                continue
+    return None
+
+
+def _json_data(r: dict) -> bytes | None:
+    for k in ("data", "data_hex", "bytes", "payload"):
+        v = r.get(k)
+        if v is None:
+            continue
+        if isinstance(v, (list, tuple)):
+            try:
+                return bytes(int(b) & 0xFF for b in v)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(v, str):
+            try:
+                return bytes.fromhex(v.replace(" ", "").replace(":", ""))
+            except ValueError:
+                continue
+    return None
+
+
+def _parse_jsonl(raw: str, path: str) -> list:
+    """Parse JSON-lines: one JSON frame object per line (optionally inside []).."""
+    recs = []
+    for ln in raw.splitlines():
+        ln = ln.strip().rstrip(",")
+        if not ln or ln in ("[", "]"):
+            continue
+        try:
+            recs.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    if not recs:
+        raise ValueError(f"{path}: not valid JSON or JSON-lines")
+    return recs
+
+
+def _load_json(raw: str, path: str = "<json>") -> list[Frame]:
+    """Load a JSON capture (any of the project's CAN reader exports).
+
+    Accepts a dict with a "frames" list, a bare list of frame objects, or
+    JSON-lines (one frame object per line). Field names and encodings vary
+    between reader versions, so each frame is read tolerantly:
+
+      * time : ts | timestamp | source_timestamp | time
+      * id   : id | can_id | arbitration_id | id_hex  (int, or hex string "0x..")
+      * data : data | data_hex | bytes | payload  (int list, or hex string)
+
+    Only receive frames are kept: transmit echoes (``dir`` tx/out/1) and
+    remote-request frames (``rtr``) are dropped, so the loader stays
+    read-only-safe. Any metadata outside "frames" (make/model/presses) is
+    ignored.
     """
-    doc = json.loads(raw)
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        doc = _parse_jsonl(raw, path)
+
     if isinstance(doc, dict):
         records = doc.get("frames")
         if records is None:
@@ -153,36 +229,12 @@ def _load_json(raw: str, path: str = "<json>") -> list[Frame]:
             continue  # skip TX echoes; keep RX
         if r.get("rtr"):
             continue  # remote-request frame carries no data payload
-        t = r.get("ts", r.get("source_timestamp"))
-        if t is None:
+        t = _json_ts(r)
+        cid = _json_id(r)
+        payload = _json_data(r)
+        if t is None or cid is None or payload is None:
             continue
-        cid = r.get("id")
-        if cid is None:
-            idh = r.get("id_hex")
-            if idh is None:
-                continue
-            try:
-                cid = int(str(idh), 16)
-            except ValueError:
-                continue
-        data = r.get("data")
-        if isinstance(data, list):
-            try:
-                payload = bytes(int(b) & 0xFF for b in data)
-            except (TypeError, ValueError):
-                continue
-        else:
-            dh = r.get("data_hex")
-            if dh is None:
-                continue
-            try:
-                payload = bytes.fromhex(str(dh).replace(" ", ""))
-            except ValueError:
-                continue
-        try:
-            out.append(Frame(float(t), int(cid), payload))
-        except (TypeError, ValueError):
-            continue
+        out.append(Frame(t, cid, payload))
     return out
 
 

@@ -23,6 +23,7 @@ results match the command line exactly.
 """
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import uuid
@@ -68,6 +69,46 @@ def _id_table(path: str):
     return len(frames), len(series), ids
 
 
+def _log_meta(path: str) -> dict:
+    """Best-effort capture header for JSON logs: make/model/year/action and the
+    recorded press labels, so you can see what the log is and what you did.
+
+    Only dict-shaped JSON captures carry a header; bare-list JSON, JSON-lines
+    and CSV/candump logs have none, so this returns {} for them.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+    except OSError:
+        return {}
+    if not raw.lstrip().startswith("{"):
+        return {}
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+    out: dict = {}
+    for k in ("make", "model", "year", "action"):
+        v = (meta or {}).get(k)
+        if v in (None, ""):
+            v = doc.get(k)
+        if v not in (None, ""):
+            out[k] = v
+    presses = doc.get("presses")
+    if isinstance(presses, list) and presses:
+        out["presses"] = len(presses)
+        labels = [p.get("label") for p in presses
+                  if isinstance(p, dict) and p.get("label")]
+        if labels:
+            out["press_labels"] = labels[:8]
+    if doc.get("saved"):
+        out["saved"] = doc.get("saved")
+    return out
+
+
 def _as_float(d: dict, key: str, default: float) -> float:
     try:
         return float(d.get(key))
@@ -90,7 +131,7 @@ def upload():
         token = _save_upload(f)
         nframes, nids, ids = _id_table(LOGS[token])
         return jsonify(token=token, filename=f.filename, frames=nframes,
-                       n_ids=nids, ids=ids)
+                       n_ids=nids, ids=ids, meta=_log_meta(LOGS[token]))
     except Exception as e:
         return jsonify(error=f"could not read log: {e}"), 400
 

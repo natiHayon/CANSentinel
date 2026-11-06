@@ -2,6 +2,7 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
 let TOKEN = null;
+let META = null;
 
 /* ---- tabs ---- */
 $$(".tab").forEach((t) => t.addEventListener("click", () => {
@@ -52,6 +53,8 @@ $("#logBtn").onclick = async () => {
     if (j.error) { err.textContent = j.error; }
     else {
       TOKEN = j.token;
+      META = j.meta || {};
+      renderMeta();
       const st = $("#logStatus");
       st.textContent = j.filename + " · " + j.frames.toLocaleString() + " frames · " + j.n_ids + " IDs";
       st.className = "badge loaded";
@@ -210,6 +213,27 @@ $("#repBtn").onclick = async () => {
   } catch (ex) { err.textContent = ex; }
   busy($("#repBtn"), false, "Run replay");
 };
+
+function renderMeta() {
+  const m = META || {};
+  const title = [m.year, m.make, m.model].filter(Boolean).join(" ");
+  const action = m.action ? esc(m.action) : "";
+  const labels = (m.press_labels && m.press_labels.length)
+    ? m.press_labels.map(esc).join(", ") : "";
+  const lm = $("#logMeta"), fm = $("#findMeta");
+  if (!(title || action || labels || m.presses)) { lm.hidden = true; fm.hidden = true; return; }
+  let chips = "";
+  if (title) chips += "<span class='mchip'>" + esc(title) + "</span>";
+  if (action) chips += "<span class='mchip hot'>" + action + "</span>";
+  if (m.presses) chips += "<span class='mchip'>" + m.presses + " press entr" + (m.presses === 1 ? "y" : "ies") + "</span>";
+  if (labels) chips += "<span class='mchip'>“" + labels + "”</span>";
+  lm.hidden = false;
+  lm.innerHTML = "<div class='mk'>Capture</div><div class='mchips'>" + chips + "</div>";
+  fm.hidden = false;
+  fm.innerHTML = "Hunting: <b>" + (action || "(unlabelled)") + "</b>" +
+    (title ? " on " + esc(title) : "") +
+    (labels ? " · you did “" + labels + "”" : "");
+}
 
 function card(k, v) { return "<div class='card'><div class='k'>" + esc(k) + "</div><div class='v'>" + v + "</div></div>"; }
 function stateTable(title, cols, rows, fmt) {

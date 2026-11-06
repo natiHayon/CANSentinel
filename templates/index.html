@@ -35,6 +35,7 @@
     </div>
     <div id="logErr" class="err"></div>
     <div id="logInfo" class="info" hidden></div>
+    <div id="logMeta" class="metacard" hidden></div>
     <div id="idTableWrap" class="tablewrap"></div>
   </section>
 
@@ -44,6 +45,7 @@
     <p class="lede">Recover the CAN ID / byte / bit behind a button, lock or switch. Tell it how many times
       you triggered the action; it ranks the fields that changed that many times and rejects machine-cadence
       chatter (rolling counters, periodic status words).</p>
+    <div id="findMeta" class="findhint" hidden></div>
     <div class="grid">
       <label>Events (how many times)
         <input id="fEvents" type="number" min="1" placeholder="e.g. 4">
@@ -63,6 +65,19 @@
         <input id="fBaseline" type="file">
       </label>
     </div>
+    <details class="explainer">
+      <summary>Which encoding? pulse vs toggle vs value &mdash; it changes what you recover</summary>
+      <div class="exbody">
+        <p>The same action is encoded differently depending on the control. Pick the wrong mode and the real field gets buried under look-alikes.</p>
+        <ul>
+          <li><b class="k-pulse">pulse bit</b> &mdash; a button that springs back: the bit goes 0&rarr;1&rarr;0 for the moment you hold it. Momentary push-buttons (lock/unlock button, rear-defrost, steering-wheel keys). Counted as <i>rising edges</i>.</li>
+          <li><b class="k-toggle">toggle bit</b> &mdash; a state that stays: one bit flips and holds between two states. Things that latch: lock <i>state</i>, gear in P, a switch left on. Counted as <i>state changes</i>.</li>
+          <li><b class="k-value">value byte</b> &mdash; many buttons on one message: a shared byte sits at an idle value and takes a distinct code per button (steering-wheel / console clusters). Counted as <i>bursts</i>; each code is listed.</li>
+          <li><b class="k-auto">auto</b> &mdash; tries all three and ranks them together. Start here, then narrow to one mode if the right field is buried.</li>
+        </ul>
+        <p class="extip"><b>Your hunt:</b> rear-defrost &ldquo;on/off/on/off&rdquo; is two signals &mdash; the <b class="k-pulse">button press</b> is a pulse (4 rising edges), while the defrost <b class="k-toggle">state</b> it sets is a toggle. Pulse finds the button; toggle finds the status bit.</p>
+      </div>
+    </details>
     <fieldset class="cadence">
       <legend>Human-cadence filter</legend>
       <div class="grid">
