@@ -17,6 +17,7 @@
 
 <nav class="tabs" id="tabs">
   <button class="tab active" data-tab="log">Log</button>
+  <button class="tab" data-tab="live">Live</button>
   <button class="tab" data-tab="find">Find control</button>
   <button class="tab" data-tab="speed">Speed</button>
   <button class="tab" data-tab="gear">Gear</button>
@@ -39,6 +40,70 @@
     <div id="logInfo" class="info" hidden></div>
     <div id="logMeta" class="metacard" hidden></div>
     <div id="idTableWrap" class="tablewrap"></div>
+  </section>
+
+  <!-- LIVE -->
+  <section class="panel" id="tab-live">
+    <h1>Live capture <span class="badge safe" style="vertical-align:middle">listen-only</span></h1>
+    <p class="lede">Connect to your CAN reader, watch live traffic, and record a capture that <b>loads straight into the analysis</b> &mdash; no download-then-upload. It still saves a named file (e.g. <span class="mono">LandRover_Defender_2026_Unlock_x4.json</span>) in <span class="mono">caps/</span>. Read-only: listen-only by default, nothing is transmitted.</p>
+    <div class="grid">
+      <label>Reader
+        <select id="lvDriver">
+          <option value="simulator">Simulator (no hardware)</option>
+          <option value="usb_can_fd">Waveshare USB-CAN-FD</option>
+          <option value="usb_can_a">Waveshare USB-CAN-A</option>
+          <option value="pythoncan">python-can</option>
+          <option value="marathon">Marathon CAN-USB</option>
+        </select>
+      </label>
+      <label>Bitrate
+        <select id="lvBitrate">
+          <option value="500000">500 kbit/s</option>
+          <option value="250000">250 kbit/s</option>
+          <option value="1000000">1 Mbit/s</option>
+          <option value="125000">125 kbit/s</option>
+        </select>
+      </label>
+      <label>Channel <span class="hint">adapter ch</span>
+        <input id="lvChannel" type="number" value="1" min="0">
+      </label>
+      <label class="check"><input id="lvListen" type="checkbox" checked> Listen-only (safe)</label>
+    </div>
+    <div class="row">
+      <button id="lvConnect" class="primary">Connect</button>
+      <button id="lvDisconnect">Disconnect</button>
+      <span id="lvStatus" class="badge muted">not connected</span>
+    </div>
+    <div id="lvErr" class="err"></div>
+
+    <div id="lvSim" hidden>
+      <h2 class="sub">Simulator actions <span class="hint">generate traffic to record</span></h2>
+      <div class="row">
+        <button class="lvsim" data-ev="unlock">Unlock</button>
+        <button class="lvsim" data-ev="lock">Lock</button>
+        <button class="lvsim" data-ev="brake">Brake</button>
+        <button class="lvsim" data-ev="horn">Horn</button>
+        <button class="lvsim" data-ev="event">Generic event</button>
+      </div>
+    </div>
+
+    <h2 class="sub">Record</h2>
+    <div class="grid">
+      <label>Make <input id="rvMake" type="text" placeholder="Land Rover"></label>
+      <label>Model <input id="rvModel" type="text" placeholder="Defender"></label>
+      <label>Year <input id="rvYear" type="text" placeholder="2026"></label>
+      <label>Action <input id="rvAction" type="text" placeholder="Unlock"></label>
+      <label>Count <span class="hint">times</span><input id="rvCount" type="number" min="1" placeholder="4"></label>
+    </div>
+    <div class="row">
+      <button id="rvStart" class="primary">&#9679; Start recording</button>
+      <button id="rvStop" hidden>&#9632; Stop &amp; load</button>
+      <span id="rvState" class="hint"></span>
+    </div>
+    <div id="rvDone" class="info" hidden></div>
+
+    <h2 class="sub">Live monitor</h2>
+    <div id="lvMon" class="tablewrap"><p class="hint">Connect to see live frames.</p></div>
   </section>
 
   <!-- FIND -->

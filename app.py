@@ -26,10 +26,11 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import uuid
 
 import numpy as np
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, send_file
 
 import find_events as fe
 import checksum_counter as cc
@@ -38,6 +39,9 @@ import live_decode as ld
 import immobilizer as imo
 import find_continuous as fc
 import find_gears as fg
+from canlink.bus import BusManager
+from canlink.drivers import create_driver, list_serial_ports
+from canlink.drivers.base import DriverError
 
 app = Flask(__name__)
 
@@ -394,6 +398,165 @@ def gear():
         "dwells": c.n_dwells, "score": round(c.score, 3), "detail": c.detail,
     } for c in cands]
     return jsonify(candidates=out)
+
+
+# ---------------------------------------------------------------------------
+# live capture (canlink) - connect, monitor, record -> auto-load into analysis
+#   READ-ONLY layer: listen-only by default, no TX exposed here.
+# ---------------------------------------------------------------------------
+
+CAPS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "caps")
+os.makedirs(CAPS_DIR, exist_ok=True)
+
+_bus = BusManager()
+_record: dict = {"active": False, "meta": {}}
+
+
+def _capture_filename(meta: dict) -> str:
+    """e.g. LandRover_Defender_2026_Parking_x4_20261106_143000.json."""
+    parts = [str(meta.get(k) or "").strip() for k in ("make", "model", "year")]
+    stem = "_".join([p for p in parts if p] + [str(meta.get("action") or "capture").strip() or "capture"])
+    if meta.get("count"):
+        stem += f"_x{meta['count']}"
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in stem).strip("_") or "capture"
+    return f"{safe}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+
+
+def _capture_doc(frames, meta: dict) -> dict:
+    count = meta.get("count")
+    presses = [{"label": meta.get("action") or "action"} for _ in range(count)] if count else []
+    return {
+        "type": "live",
+        "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "meta": {k: meta.get(k, "") for k in ("make", "model", "year", "action")},
+        "presses": presses,
+        "frame_count": len(frames),
+        "frames": [f.to_dict() for f in frames],
+    }
+
+
+@app.get("/api/live/ports")
+def live_ports():
+    return jsonify(ports=list_serial_ports())
+
+
+@app.get("/api/live/status")
+def live_status():
+    out = {"connected": _bus.connected, "recording": _record["active"]}
+    if _bus.connected:
+        st = _bus.status()
+        out.update(rx=st.get("rx"), seq=st.get("seq"),
+                   driver=(st.get("driver") or {}).get("name"))
+    return jsonify(out)
+
+
+@app.post("/api/live/connect")
+def live_connect():
+    body = request.get_json(force=True, silent=True) or {}
+    listen_only = bool(body.get("listen_only", True))
+    cfg = {
+        "driver": body.get("driver", "simulator"),
+        "bitrate": int(body.get("bitrate", 500000)),
+        "fd": bool(body.get("fd", True)),
+        "fd_channel": int(body.get("channel", 1)),
+        "fd_listen_only": listen_only,
+        "mar_channel": int(body.get("channel", 0)),
+        "mar_listen_only": listen_only,
+        "mode": "silent" if listen_only else "normal",
+        "serial_port": body.get("serial_port", ""),
+        "pythoncan_interface": body.get("pythoncan_interface", "socketcan"),
+        "pythoncan_channel": body.get("pythoncan_channel", "can0"),
+    }
+    try:
+        if _bus.connected:
+            _bus.disconnect()
+        _bus.connect(create_driver(cfg))
+    except DriverError as e:
+        return jsonify(error=str(e)), 400
+    except Exception as e:
+        return jsonify(error=f"connect failed: {e}"), 400
+    return jsonify(ok=True, connected=True, driver=(_bus.status().get("driver") or {}))
+
+
+@app.post("/api/live/disconnect")
+def live_disconnect():
+    _record["active"] = False
+    try:
+        _bus.stop_capture()
+    except Exception:
+        pass
+    _bus.disconnect()
+    return jsonify(ok=True, connected=False)
+
+
+@app.get("/api/live/frames")
+def live_frames():
+    if not _bus.connected:
+        return jsonify(frames=[], seq=0, connected=False)
+    since = int(request.args.get("since", 0))
+    return jsonify(frames=_bus.snapshot(limit=200, since_seq=since),
+                   seq=_bus.current_seq, connected=True, recording=_record["active"])
+
+
+@app.post("/api/live/sim/trigger")
+def live_sim_trigger():
+    drv = _bus.driver
+    if drv is None or not hasattr(drv, "inject"):
+        return jsonify(error="Trigger is only available on the simulator."), 409
+    drv.inject((request.get_json(force=True, silent=True) or {}).get("event", ""))
+    return jsonify(ok=True)
+
+
+@app.post("/api/live/record/start")
+def live_record_start():
+    if not _bus.connected:
+        return jsonify(error="Connect to a bus first."), 409
+    body = request.get_json(force=True, silent=True) or {}
+    meta = {k: (body.get(k) or "") for k in ("make", "model", "year", "action")}
+    try:
+        meta["count"] = int(body["count"]) if body.get("count") not in (None, "") else None
+    except (ValueError, TypeError):
+        meta["count"] = None
+    _record["meta"] = meta
+    _bus.start_capture()
+    _record["active"] = True
+    return jsonify(ok=True, recording=True)
+
+
+@app.post("/api/live/record/stop")
+def live_record_stop():
+    if not _record["active"]:
+        return jsonify(error="Not recording."), 409
+    frames = _bus.stop_capture()
+    _record["active"] = False
+    meta = dict(_record["meta"])
+    doc = _capture_doc(frames, meta)
+    name = _capture_filename(meta)
+    # keep the file, exactly like before
+    with open(os.path.join(CAPS_DIR, name), "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    # auto-load: register as the current analysis log (no manual download/upload)
+    token = uuid.uuid4().hex[:12]
+    up_path = os.path.join(UPLOAD_DIR, f"{token}_{name}")
+    with open(up_path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    LOGS[token] = up_path
+    try:
+        nframes, nids, ids = _id_table(up_path)
+    except Exception as e:
+        return jsonify(error=f"Capture saved as {name} but could not be analyzed: {e}"), 400
+    return jsonify(ok=True, token=token, filename=name,
+                   frames=nframes, n_ids=nids, ids=ids, meta=_log_meta(up_path))
+
+
+@app.get("/api/live/download")
+def live_download():
+    path = LOGS.get(request.args.get("token", ""))
+    if not path or not os.path.exists(path):
+        return jsonify(error="unknown capture"), 404
+    name = os.path.basename(path).split("_", 1)[-1]
+    return send_file(path, as_attachment=True, download_name=name,
+                     mimetype="application/json")
 
 
 # ---------------------------------------------------------------------------

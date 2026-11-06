@@ -73,6 +73,84 @@ $("#logBtn").onclick = async () => {
   busy($("#logBtn"), false, "Load log");
 };
 
+/* ---- Live capture ---- */
+let LIVE = { connected: false, timer: null, seq: 0, ids: {} };
+
+function lvRender() {
+  const keys = Object.keys(LIVE.ids).sort();
+  if (!keys.length) { $("#lvMon").innerHTML = "<p class='hint'>Waiting for frames…</p>"; return; }
+  let h = "<table><tr><th>ID</th><th>last data</th><th>count</th><th>dir</th></tr>";
+  keys.forEach((k) => { const r = LIVE.ids[k]; h += "<tr><td class='mono'>" + k + "</td><td class='mono'>" + esc(r.data) + "</td><td>" + r.count + "</td><td>" + r.dir + "</td></tr>"; });
+  $("#lvMon").innerHTML = h + "</table>";
+}
+async function lvPoll() {
+  if (!LIVE.connected) return;
+  try {
+    const r = await fetch("/api/live/frames?since=" + LIVE.seq);
+    const j = await r.json();
+    if (j.seq) LIVE.seq = j.seq;
+    (j.frames || []).forEach((f) => {
+      const e = LIVE.ids[f.id_hex] || (LIVE.ids[f.id_hex] = { count: 0, data: "", dir: f.dir });
+      e.count++; e.data = f.data_hex; e.dir = f.dir;
+    });
+    lvRender();
+    $("#lvStatus").textContent = "connected · " + Object.keys(LIVE.ids).length + " IDs";
+  } catch (ex) { /* transient */ }
+}
+$("#lvConnect").onclick = async () => {
+  const err = $("#lvErr"); err.textContent = "";
+  busy($("#lvConnect"), true);
+  try {
+    const j = await postJSON("/api/live/connect", {
+      driver: $("#lvDriver").value, bitrate: $("#lvBitrate").value,
+      channel: $("#lvChannel").value, listen_only: $("#lvListen").checked,
+    });
+    if (j.error) { err.textContent = j.error; }
+    else {
+      LIVE.connected = true; LIVE.seq = 0; LIVE.ids = {};
+      $("#lvStatus").textContent = "connected · " + ((j.driver && j.driver.name) || "");
+      $("#lvStatus").className = "badge loaded";
+      $("#lvSim").hidden = ($("#lvDriver").value !== "simulator");
+      if (LIVE.timer) clearInterval(LIVE.timer);
+      LIVE.timer = setInterval(lvPoll, 600);
+    }
+  } catch (ex) { err.textContent = ex; }
+  busy($("#lvConnect"), false, "Connect");
+};
+$("#lvDisconnect").onclick = async () => {
+  try { await postJSON("/api/live/disconnect", {}); } catch (ex) { /* ignore */ }
+  LIVE.connected = false; if (LIVE.timer) clearInterval(LIVE.timer);
+  $("#lvStatus").textContent = "not connected"; $("#lvStatus").className = "badge muted";
+  $("#lvSim").hidden = true;
+};
+$$(".lvsim").forEach((b) => b.onclick = () => postJSON("/api/live/sim/trigger", { event: b.dataset.ev }));
+$("#rvStart").onclick = async () => {
+  const err = $("#lvErr"); err.textContent = "";
+  if (!LIVE.connected) { err.textContent = "Connect first."; return; }
+  const j = await postJSON("/api/live/record/start", {
+    make: $("#rvMake").value, model: $("#rvModel").value, year: $("#rvYear").value,
+    action: $("#rvAction").value, count: $("#rvCount").value,
+  });
+  if (j.error) { err.textContent = j.error; return; }
+  $("#rvStart").hidden = true; $("#rvStop").hidden = false; $("#rvState").textContent = "recording…";
+};
+$("#rvStop").onclick = async () => {
+  const j = await postJSON("/api/live/record/stop", {});
+  $("#rvStop").hidden = true; $("#rvStart").hidden = false; $("#rvState").textContent = "";
+  if (j.error) { $("#lvErr").textContent = j.error; return; }
+  TOKEN = j.token; META = j.meta || {}; renderMeta();
+  const st = $("#logStatus");
+  st.textContent = j.filename + " · " + j.frames.toLocaleString() + " frames · " + j.n_ids + " IDs";
+  st.className = "badge loaded";
+  const done = $("#rvDone"); done.hidden = false;
+  done.innerHTML = "Recorded <b>" + esc(j.filename) + "</b> — " + j.frames.toLocaleString() +
+    " frames, " + j.n_ids + " IDs. <b>Loaded into the analysis</b> — go to Find / Speed / Gear. " +
+    "<a href='/api/live/download?token=" + encodeURIComponent(j.token) + "'>Download file</a>";
+  let h = "<table><tr><th>CAN ID</th><th>Frames</th><th>DLC</th><th>Cycle (ms)</th></tr>";
+  j.ids.forEach((x) => { h += "<tr><td class='mono'>" + x.id + "</td><td>" + x.frames + "</td><td>" + x.dlc + "</td><td>" + x.cycle_ms + "</td></tr>"; });
+  $("#idTableWrap").innerHTML = h + "</table>";
+};
+
 /* ---- Find ---- */
 $("#findBtn").onclick = async () => {
   const err = $("#findErr"); err.textContent = ""; $("#findOut").innerHTML = "";
