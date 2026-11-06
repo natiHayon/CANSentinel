@@ -37,6 +37,7 @@ import vehicle_profile as vp
 import live_decode as ld
 import immobilizer as imo
 import find_continuous as fc
+import find_gears as fg
 
 app = Flask(__name__)
 
@@ -363,6 +364,34 @@ def continuous():
         "endian": c.endian, "signed": c.signed,
         "vmin": round(c.vmin, 1), "vmax": round(c.vmax, 1),
         "score": round(c.score, 3), "detail": c.detail,
+    } for c in cands]
+    return jsonify(candidates=out)
+
+
+# ---------------------------------------------------------------------------
+# gear selector  (find_gears)  - the park-gate finder
+# ---------------------------------------------------------------------------
+
+@app.post("/api/gear")
+def gear():
+    d = request.get_json(force=True)
+    token = d.get("token")
+    if token not in LOGS:
+        return jsonify(error="load a log first"), 400
+    only = fe._parse_id_list(d.get("only_ids") or None)
+    try:
+        positions = int(d["positions"]) if d.get("positions") not in (None, "", "auto") else None
+    except (ValueError, TypeError):
+        positions = None
+    try:
+        cands = fg.analyze(LOGS[token], positions=positions, top=12, only_ids=only)
+    except Exception as e:
+        return jsonify(error=str(e)), 400
+    out = [{
+        "id": f"0x{c.can_id:X}", "byte": c.byte, "bit": c.bit, "width": c.width,
+        "start_bit": c.byte * 8 + c.bit,
+        "values": [f"0x{v:X}" for v in c.values],
+        "dwells": c.n_dwells, "score": round(c.score, 3), "detail": c.detail,
     } for c in cands]
     return jsonify(candidates=out)
 

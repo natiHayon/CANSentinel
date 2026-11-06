@@ -19,6 +19,7 @@
   <button class="tab active" data-tab="log">Log</button>
   <button class="tab" data-tab="find">Find control</button>
   <button class="tab" data-tab="speed">Speed</button>
+  <button class="tab" data-tab="gear">Gear</button>
   <button class="tab" data-tab="checksum">Counter &amp; checksum</button>
   <button class="tab" data-tab="profile">Profile</button>
   <button class="tab" data-tab="replay">Replay</button>
@@ -112,6 +113,24 @@
     <div id="contOut" class="tablewrap"></div>
     <p class="hint">For an exact scale/offset fit, run the CLI with a reference value trace:
       <span class="mono">python find_continuous.py --trace yourlog --reference gps_speed.txt</span></p>
+  </section>
+
+  <!-- GEAR -->
+  <section class="panel" id="tab-gear">
+    <h1>Find the gear selector <span class="sim" style="background:var(--good);color:#03130f">GATE</span></h1>
+    <p class="lede">The other standstill gate is <b>gear in P/N</b>. Gear is a small <b>held</b> bit-field (a nibble) &mdash; not a button and not a whole byte &mdash; so it needs its own search. Shift through the gears during the capture (<b>P &rarr; R &rarr; N &rarr; D &rarr; &hellip;</b>), tell it how many positions you used, and it finds the latched sub-field that holds that many stable levels.</p>
+    <div class="row">
+      <label>Positions <span class="hint">how many gears</span>
+        <input id="gPos" type="number" min="2" placeholder="e.g. 4">
+      </label>
+      <label class="inline">Only these IDs <span class="hint">optional</span>
+        <input id="gOnly" type="text" placeholder="0x3C0">
+      </label>
+      <button id="gearBtn" class="primary">Find gear</button>
+    </div>
+    <div id="gearErr" class="err"></div>
+    <div id="gearOut" class="tablewrap"></div>
+    <p class="hint">The held codes are the gear values &mdash; identify which one is <b>Park</b>, then add the field to a profile as the gear gate.</p>
   </section>
 
   <!-- CHECKSUM -->

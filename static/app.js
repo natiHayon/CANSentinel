@@ -137,6 +137,31 @@ $("#contBtn").onclick = async () => {
   busy($("#contBtn"), false, "Find continuous");
 };
 
+/* ---- Gear ---- */
+$("#gearBtn").onclick = async () => {
+  const err = $("#gearErr"); err.textContent = ""; $("#gearOut").innerHTML = "";
+  if (needLog(err)) return;
+  busy($("#gearBtn"), true);
+  try {
+    const j = await postJSON("/api/gear", { token: TOKEN, positions: $("#gPos").value.trim(), only_ids: $("#gOnly").value.trim() });
+    if (j.error) { err.textContent = j.error; }
+    else if (!j.candidates.length) {
+      $("#gearOut").innerHTML = "<p class='lede'>No gear-like fields. Shift through the gears during the capture and set how many positions you used.</p>";
+    } else {
+      let h = "<table><tr><th class='rank'>#</th><th>ID</th><th>field</th><th>held codes</th><th>dwells</th><th>score</th></tr>";
+      j.candidates.forEach((c, i) => {
+        const w = Math.max(6, Math.min(120, c.score * 110));
+        h += "<tr class='" + (i === 0 ? "top1" : "") + "'><td class='rank'>" + (i + 1) +
+          "</td><td class='mono'>" + c.id + "</td><td>byte " + c.byte + ", bit " + c.bit + ", w" + c.width +
+          "</td><td class='mono'>" + c.values.join(", ") + "</td><td>" + c.dwells +
+          "</td><td><span class='scorebar' style='width:" + w + "px'></span> " + c.score.toFixed(3) + "</td></tr>";
+      });
+      $("#gearOut").innerHTML = h + "</table>";
+    }
+  } catch (ex) { err.textContent = ex; }
+  busy($("#gearBtn"), false, "Find gear");
+};
+
 /* ---- Checksum ---- */
 $("#chkBtn").onclick = async () => {
   const err = $("#chkErr"); err.textContent = ""; $("#chkOut").innerHTML = "";
