@@ -110,6 +110,33 @@ $("#findBtn").onclick = async () => {
   busy($("#findBtn"), false, "Find");
 };
 
+/* ---- Speed / continuous ---- */
+$("#contBtn").onclick = async () => {
+  const err = $("#contErr"); err.textContent = ""; $("#contOut").innerHTML = "";
+  if (needLog(err)) return;
+  busy($("#contBtn"), true);
+  try {
+    const j = await postJSON("/api/continuous", { token: TOKEN, only_ids: $("#cOnly").value.trim() });
+    if (j.error) { err.textContent = j.error; }
+    else if (!j.candidates.length) {
+      $("#contOut").innerHTML = "<p class='lede'>No continuous candidates. Make sure you drove a clear 0→speed→0 maneuver during the capture.</p>";
+    } else {
+      let h = "<table><tr><th class='rank'>#</th><th>ID</th><th>field</th><th>type</th><th>raw range</th><th>score</th><th>detail</th></tr>";
+      j.candidates.forEach((c, i) => {
+        const w = Math.max(6, Math.min(120, c.score * 110));
+        const typ = c.width + "-bit" + (c.width === 16 ? " " + c.endian : "") + (c.signed ? " signed" : "");
+        h += "<tr class='" + (i === 0 ? "top1" : "") + "'><td class='rank'>" + (i + 1) +
+          "</td><td class='mono'>" + c.id + "</td><td>byte " + c.byte +
+          "</td><td><span class='pill'>" + typ + "</span></td><td class='mono'>" + c.vmin + "–" + c.vmax +
+          "</td><td><span class='scorebar' style='width:" + w + "px'></span> " + c.score.toFixed(3) +
+          "</td><td>" + esc(c.detail) + "</td></tr>";
+      });
+      $("#contOut").innerHTML = h + "</table>";
+    }
+  } catch (ex) { err.textContent = ex; }
+  busy($("#contBtn"), false, "Find continuous");
+};
+
 /* ---- Checksum ---- */
 $("#chkBtn").onclick = async () => {
   const err = $("#chkErr"); err.textContent = ""; $("#chkOut").innerHTML = "";

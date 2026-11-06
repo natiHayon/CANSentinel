@@ -36,6 +36,7 @@ import checksum_counter as cc
 import vehicle_profile as vp
 import live_decode as ld
 import immobilizer as imo
+import find_continuous as fc
 
 app = Flask(__name__)
 
@@ -340,6 +341,30 @@ def replay():
             "buttons": [{"t": round(t - base, 3), "button": b} for (t, b) in btns][:100],
         }
     return jsonify(**out)
+
+
+# ---------------------------------------------------------------------------
+# continuous signals  (find_continuous)  - the standstill-gate speed finder
+# ---------------------------------------------------------------------------
+
+@app.post("/api/continuous")
+def continuous():
+    d = request.get_json(force=True)
+    token = d.get("token")
+    if token not in LOGS:
+        return jsonify(error="load a log first"), 400
+    only = fe._parse_id_list(d.get("only_ids") or None)
+    try:
+        cands = fc.analyze(LOGS[token], reference_path=None, top=12, only_ids=only)
+    except Exception as e:
+        return jsonify(error=str(e)), 400
+    out = [{
+        "id": f"0x{c.can_id:X}", "byte": c.start_bit // 8, "width": c.width,
+        "endian": c.endian, "signed": c.signed,
+        "vmin": round(c.vmin, 1), "vmax": round(c.vmax, 1),
+        "score": round(c.score, 3), "detail": c.detail,
+    } for c in cands]
+    return jsonify(candidates=out)
 
 
 # ---------------------------------------------------------------------------
