@@ -2,6 +2,23 @@
 
 > CAN-bus anti-theft immobilizer toolkit: find button/lock signals, crack rolling counters and checksums, certify a whole vehicle platform from one car, and run a standstill-gated, fail-open immobilizer. Read-only analysis + an on-device reference state machine. Every tool runs offline with `--selftest`.
 
+## Quick start — web UI (no command line)
+
+```bash
+git clone https://github.com/natiHayon/CANSentinel.git
+cd CANSentinel
+python3 -m venv .venv && . .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python app.py                                      # open http://127.0.0.1:5000
+```
+
+The UI (`app.py`, Flask, runs only on your machine) lets you **load a CAN log,
+say how many times you did an action, and get the button/lock ID** — and a second
+tab cracks the **rolling counter + checksum** of any message. Thin wrapper over
+the same functions the CLI tools use, so results match exactly. Read-only.
+
+## Command line
+
 This folder adds `find_events.py`: a read-only tool that finds the CAN
 **ID / byte / bit** behind a **discrete action** — a button press, a lock/unlock,
 a stalk or switch, a gear position. It is the thing you said is painful ("very
