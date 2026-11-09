@@ -106,7 +106,15 @@
     </div>
     <div id="rvDone" class="info" hidden></div>
 
-    <h2 class="sub">Live monitor</h2>
+    <h2 class="sub">Live monitor <span class="hint">click an ID row to watch it</span></h2>
+    <div class="row">
+      <label class="inline">Watch one ID
+        <input id="lvWatch" type="text" placeholder="0x318" style="width:110px">
+      </label>
+      <button id="lvWatchBtn" class="primary">Watch</button>
+      <button id="lvWatchClear">Clear</button>
+    </div>
+    <div id="lvWatchOut" class="tablewrap" hidden></div>
     <div id="lvMon" class="tablewrap"><p class="hint">Connect to see live frames.</p></div>
   </section>
 

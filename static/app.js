@@ -74,13 +74,13 @@ $("#logBtn").onclick = async () => {
 };
 
 /* ---- Live capture ---- */
-let LIVE = { connected: false, timer: null, seq: 0, ids: {} };
+let LIVE = { connected: false, timer: null, seq: 0, ids: {}, watchId: null, watchBytes: [] };
 
 function lvRender() {
   const keys = Object.keys(LIVE.ids).sort();
   if (!keys.length) { $("#lvMon").innerHTML = "<p class='hint'>Waiting for frames…</p>"; return; }
   let h = "<table><tr><th>ID</th><th>last data</th><th>count</th><th>dir</th></tr>";
-  keys.forEach((k) => { const r = LIVE.ids[k]; h += "<tr><td class='mono'>" + k + "</td><td class='mono'>" + esc(r.data) + "</td><td>" + r.count + "</td><td>" + r.dir + "</td></tr>"; });
+  keys.forEach((k) => { const r = LIVE.ids[k]; h += "<tr data-wid='" + k + "' style='cursor:pointer'><td class='mono'>" + k + "</td><td class='mono'>" + esc(r.data) + "</td><td>" + r.count + "</td><td>" + r.dir + "</td></tr>"; });
   $("#lvMon").innerHTML = h + "</table>";
 }
 async function lvPoll() {
@@ -92,11 +92,51 @@ async function lvPoll() {
     (j.frames || []).forEach((f) => {
       const e = LIVE.ids[f.id_hex] || (LIVE.ids[f.id_hex] = { count: 0, data: "", dir: f.dir });
       e.count++; e.data = f.data_hex; e.dir = f.dir;
+      if (LIVE.watchId !== null && f.id === LIVE.watchId && Array.isArray(f.data)) {
+        f.data.forEach((val, i) => {
+          const b = LIVE.watchBytes[i] || (LIVE.watchBytes[i] = { cur: val, distinct: new Set(), changes: 0, flash: false });
+          b.flash = (val !== b.cur);
+          if (b.flash) b.changes++;
+          b.cur = val; b.distinct.add(val);
+        });
+      }
     });
     lvRender();
+    if (LIVE.watchId !== null) renderWatch();
     $("#lvStatus").textContent = "connected · " + Object.keys(LIVE.ids).length + " IDs";
   } catch (ex) { /* transient */ }
 }
+
+function renderWatch() {
+  if (LIVE.watchId === null) return;
+  const idh = "0x" + LIVE.watchId.toString(16).toUpperCase();
+  let h = "<div class='mk' style='margin-bottom:6px'>Watching " + idh + " — shift / press and watch a byte change</div>";
+  if (!LIVE.watchBytes.length) { $("#lvWatchOut").innerHTML = h + "<p class='hint'>Waiting for this ID on the bus…</p>"; return; }
+  h += "<table><tr><th>byte</th><th>value</th><th>binary</th><th>changes</th><th>distinct values seen</th></tr>";
+  LIVE.watchBytes.forEach((b, i) => {
+    const hex = "0x" + b.cur.toString(16).toUpperCase().padStart(2, "0");
+    const bin = b.cur.toString(2).padStart(8, "0");
+    const dv = Array.from(b.distinct).sort((x, y) => x - y)
+      .map((v) => v.toString(16).toUpperCase().padStart(2, "0")).slice(0, 14).join(" ");
+    h += "<tr><td>" + i + "</td><td class='mono " + (b.flash ? "warn" : "") + "'>" + hex +
+      "</td><td class='mono'>" + bin + "</td><td>" + b.changes +
+      "</td><td class='mono'>" + dv + " <span class='pill'>" + b.distinct.size + "</span></td></tr>";
+  });
+  $("#lvWatchOut").innerHTML = h + "</table>";
+}
+function lvSetWatch(idStr) {
+  const s = (idStr || "").trim().toLowerCase().replace(/^0x/, "");
+  if (!s) { LIVE.watchId = null; LIVE.watchBytes = []; $("#lvWatchOut").hidden = true; return; }
+  const id = parseInt(s, 16);
+  if (isNaN(id)) { $("#lvErr").textContent = "Enter a hex ID like 0x318."; return; }
+  LIVE.watchId = id; LIVE.watchBytes = [];
+  $("#lvWatch").value = "0x" + id.toString(16).toUpperCase();
+  $("#lvWatchOut").hidden = false;
+  renderWatch();
+}
+$("#lvWatchBtn").onclick = () => lvSetWatch($("#lvWatch").value);
+$("#lvWatchClear").onclick = () => lvSetWatch("");
+$("#lvMon").onclick = (e) => { const tr = e.target.closest("tr[data-wid]"); if (tr) lvSetWatch(tr.getAttribute("data-wid")); };
 $("#lvConnect").onclick = async () => {
   const err = $("#lvErr"); err.textContent = "";
   busy($("#lvConnect"), true);
