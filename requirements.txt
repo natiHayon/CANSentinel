@@ -1,2 +1,6 @@
 numpy>=1.24
 flask>=3.0
+# Optional - only for LIVE hardware capture (the offline analysis and the
+# simulator need neither). Install when connecting a real reader:
+#   pyserial      # Waveshare USB-CAN-A, serial-port enumeration
+#   python-can    # the python-can driver backend

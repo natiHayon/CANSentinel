@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+# live-capture runtime artifacts (recordings + driver config), not source
+caps/
+config.json
+mappings.json
+# vendor SDK for the Waveshare USB-CAN-FD driver (native DLLs) - keep it local,
+# copy sdk/ from your reader's SDK; required only for live FD hardware
+sdk/

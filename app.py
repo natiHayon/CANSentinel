@@ -2,38 +2,56 @@
 """
 app.py - CANSentinel local web UI.
 
-A browser front-end for the toolkit so you can work without the command line:
-load a CAN log, say what you did, and it finds the button/lock ID or cracks the
-counter/checksum. Runs entirely on your machine (binds to 127.0.0.1); it only
-reads logs you load - nothing is transmitted and nothing leaves your PC.
+A browser front-end for the whole offline toolkit, so you can work the pipeline
+without the command line:
+
+    Log explorer -> Find control -> Counter & checksum -> Profile -> Replay
+
+It runs entirely on your machine (binds 127.0.0.1) and is strictly READ-ONLY:
+it never opens a CAN interface and never transmits. It only reads logs you load,
+and the Replay/immobilizer tab is a pure simulation over a recorded log. Nothing
+leaves your PC.
 
 Run:
     pip install -r requirements.txt
-    python app.py
-    # then open http://127.0.0.1:5000
+    python app.py                 # http://127.0.0.1:5000
+    PORT=5050 python app.py       # use another port (e.g. if 5000 is busy)
 
-Everything it does is a thin wrapper over the same functions the CLI tools use
-(find_events.py, checksum_counter.py), so results match the command line exactly.
+Every endpoint is a thin wrapper over the same functions the CLI tools use
+(find_events, checksum_counter, vehicle_profile, live_decode, immobilizer), so
+results match the command line exactly.
 """
 from __future__ import annotations
 
+import json
 import os
 import tempfile
+import time
 import uuid
 
-from flask import Flask, request, jsonify, render_template_string
+import numpy as np
+from flask import Flask, request, jsonify, render_template, send_file
 
 import find_events as fe
 import checksum_counter as cc
+import vehicle_profile as vp
+import live_decode as ld
+import immobilizer as imo
+import find_continuous as fc
+import find_gears as fg
+from canlink.bus import BusManager
+from canlink.drivers import create_driver, list_serial_ports
+from canlink.drivers.base import DriverError
 
 app = Flask(__name__)
+
 UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "cansentinel_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 LOGS: dict[str, str] = {}   # token -> saved path
 
 
 # ---------------------------------------------------------------------------
-# API
+# helpers
 # ---------------------------------------------------------------------------
 
 def _save_upload(file_storage) -> str:
@@ -45,6 +63,69 @@ def _save_upload(file_storage) -> str:
     return token
 
 
+def _id_table(path: str):
+    frames = fe.load_log(path)
+    series = fe.build_series(frames)
+    ids = []
+    for cid in sorted(series):
+        s = series[cid]
+        cyc = float(np.median(np.diff(s.t)) * 1000) if s.t.size > 1 else 0.0
+        ids.append({"id": f"0x{cid:X}", "frames": s.n, "dlc": s.length,
+                    "cycle_ms": round(cyc, 1)})
+    return len(frames), len(series), ids
+
+
+def _log_meta(path: str) -> dict:
+    """Best-effort capture header for JSON logs: make/model/year/action and the
+    recorded press labels, so you can see what the log is and what you did.
+
+    Only dict-shaped JSON captures carry a header; bare-list JSON, JSON-lines
+    and CSV/candump logs have none, so this returns {} for them.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+    except OSError:
+        return {}
+    if not raw.lstrip().startswith("{"):
+        return {}
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+    out: dict = {}
+    for k in ("make", "model", "year", "action"):
+        v = (meta or {}).get(k)
+        if v in (None, ""):
+            v = doc.get(k)
+        if v not in (None, ""):
+            out[k] = v
+    presses = doc.get("presses")
+    if isinstance(presses, list) and presses:
+        out["presses"] = len(presses)
+        labels = [p.get("label") for p in presses
+                  if isinstance(p, dict) and p.get("label")]
+        if labels:
+            out["press_labels"] = labels[:8]
+    if doc.get("saved"):
+        out["saved"] = doc.get("saved")
+    return out
+
+
+def _as_float(d: dict, key: str, default: float) -> float:
+    try:
+        return float(d.get(key))
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# upload / log explorer
+# ---------------------------------------------------------------------------
+
 @app.post("/api/upload")
 def upload():
     if "file" not in request.files:
@@ -54,20 +135,16 @@ def upload():
         return jsonify(error="empty filename"), 400
     try:
         token = _save_upload(f)
-        frames = fe.load_log(LOGS[token])
-        series = fe.build_series(frames)
-        ids = []
-        for cid in sorted(series):
-            s = series[cid]
-            import numpy as np
-            cyc = float(np.median(np.diff(s.t)) * 1000) if s.t.size > 1 else 0.0
-            ids.append({"id": f"0x{cid:X}", "frames": s.n, "dlc": s.length,
-                        "cycle_ms": round(cyc, 1)})
-        return jsonify(token=token, filename=f.filename, frames=len(frames),
-                       n_ids=len(series), ids=ids)
+        nframes, nids, ids = _id_table(LOGS[token])
+        return jsonify(token=token, filename=f.filename, frames=nframes,
+                       n_ids=nids, ids=ids, meta=_log_meta(LOGS[token]))
     except Exception as e:
         return jsonify(error=f"could not read log: {e}"), 400
 
+
+# ---------------------------------------------------------------------------
+# find a control  (find_events, incl. the human-cadence filter)
+# ---------------------------------------------------------------------------
 
 @app.post("/api/find")
 def find():
@@ -78,14 +155,19 @@ def find():
     baseline = LOGS.get(d.get("baseline_token")) if d.get("baseline_token") else None
     try:
         events = int(d["events"]) if d.get("events") not in (None, "", "auto") else None
-    except ValueError:
+    except (ValueError, TypeError):
         events = None
     mode = d.get("mode", "auto")
     only = fe._parse_id_list(d.get("only_ids") or None)
+    min_gap = _as_float(d, "min_gap", 0.30)
+    settle_gap = _as_float(d, "settle_gap", 1.0)
+    drop = bool(d.get("drop_implausible"))
     try:
         cands = fe.analyze(trace=LOGS[token], n_events=events, event_times_path=None,
                            baseline=baseline, tol=0.5, mode=mode, idle_frac_max=0.2,
-                           only_ids=only, exclude_ids=None, top=12)
+                           only_ids=only, exclude_ids=None, top=12,
+                           min_gap=min_gap, settle_gap=settle_gap,
+                           drop_implausible=drop)
     except Exception as e:
         return jsonify(error=str(e)), 400
     out = []
@@ -106,6 +188,10 @@ def find():
     return jsonify(candidates=out)
 
 
+# ---------------------------------------------------------------------------
+# rolling counter + checksum  (checksum_counter)
+# ---------------------------------------------------------------------------
+
 @app.post("/api/checksum")
 def checksum():
     d = request.get_json(force=True)
@@ -118,7 +204,6 @@ def checksum():
     except Exception as e:
         return jsonify(error=str(e)), 400
     want = d.get("id")
-    targets = []
     if want:
         try:
             cid = int(want, 16)
@@ -149,198 +234,347 @@ def checksum():
 
 
 # ---------------------------------------------------------------------------
-# UI
+# vehicle profile  (vehicle_profile)
 # ---------------------------------------------------------------------------
 
-PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CANSentinel</title>
-<style>
-  :root{--bg:#0f1115;--panel:#171a21;--line:#262b36;--fg:#e6e9ef;--mut:#8b93a7;
-        --accent:#4ea1ff;--good:#37d19a;--warn:#f0b24a;--chip:#1f2530;}
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);
-       font:15px/1.5 ui-sans-serif,system-ui,Segoe UI,Roboto,Arial}
-  header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;
-         align-items:baseline;gap:12px}
-  header h1{font-size:19px;margin:0;letter-spacing:.3px}
-  header .sub{color:var(--mut);font-size:13px}
-  main{max-width:1000px;margin:0 auto;padding:24px 16px}
-  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-         padding:18px;margin-bottom:18px}
-  .panel h2{font-size:14px;margin:0 0 12px;color:var(--mut);text-transform:uppercase;
-            letter-spacing:.6px}
-  label{display:block;font-size:13px;color:var(--mut);margin:10px 0 4px}
-  input,select{background:#0c0e13;border:1px solid var(--line);color:var(--fg);
-       border-radius:7px;padding:9px 10px;font-size:14px;width:100%}
-  .row{display:flex;gap:14px;flex-wrap:wrap}
-  .row>div{flex:1;min-width:150px}
-  button{background:var(--accent);color:#061018;border:0;border-radius:7px;
-       padding:10px 16px;font-weight:600;font-size:14px;cursor:pointer;margin-top:12px}
-  button.ghost{background:var(--chip);color:var(--fg);border:1px solid var(--line)}
-  button:disabled{opacity:.5;cursor:not-allowed}
-  .chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
-  .chip{background:var(--chip);border:1px solid var(--line);border-radius:999px;
-        padding:4px 11px;font-size:12px;color:var(--mut)}
-  table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}
-  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
-  th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase}
-  tr.top td{background:rgba(78,161,255,.08)}
-  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-  .tag{font-size:11px;padding:2px 7px;border-radius:5px;background:var(--chip)}
-  .tag.pulse{color:#8fd4ff}.tag.toggle{color:#c6a6ff}.tag.value{color:#ffd28f}
-  .ok{color:var(--good)}.bad{color:var(--warn)}
-  .tabs{display:flex;gap:6px;margin-bottom:16px}
-  .tabs button{margin:0;background:var(--chip);color:var(--fg);
-       border:1px solid var(--line);font-weight:500}
-  .tabs button.active{background:var(--accent);color:#061018;border-color:var(--accent)}
-  .hide{display:none}.hint{color:var(--mut);font-size:12px;margin-top:6px}
-  .err{color:var(--warn);margin-top:10px;font-size:13px}
-  .score-bar{height:6px;background:var(--chip);border-radius:3px;overflow:hidden;width:70px;display:inline-block;vertical-align:middle}
-  .score-bar>i{display:block;height:100%;background:var(--good)}
-</style></head><body>
-<header><h1>CANSentinel</h1><span class="sub">CAN anti-theft toolkit &middot; local, read-only</span></header>
-<main>
-  <div class="panel">
-    <h2>1 &middot; Load a CAN log</h2>
-    <div class="row"><div>
-      <input type="file" id="logfile" accept=".csv,.log,.txt,.candump,.dump,.asc">
-      <div class="hint">webCAN / CANsub CSV, candump, or generic epoch;id;data. Read-only.</div>
-    </div><div style="flex:0">
-      <button id="loadBtn">Load</button>
-    </div></div>
-    <div id="summary" class="chips hide"></div>
-    <div id="loadErr" class="err"></div>
-  </div>
+@app.get("/api/profile/example")
+def profile_example():
+    return jsonify(profile=vp.EXAMPLE_PROFILE)
 
-  <div class="panel" id="work" style="opacity:.5;pointer-events:none">
-    <div class="tabs">
-      <button class="active" data-tab="find">Find a control</button>
-      <button data-tab="chk">Counter &amp; checksum</button>
-    </div>
 
-    <div id="tab-find">
-      <h2>Find a button / lock / switch</h2>
-      <div class="row">
-        <div><label>How many times you did it</label>
-          <input id="events" type="number" min="1" placeholder="e.g. 4" value="4"></div>
-        <div><label>Encoding</label>
-          <select id="mode">
-            <option value="auto">auto (try all)</option>
-            <option value="pulse">pulse bit (momentary button)</option>
-            <option value="toggle">toggle bit (lock / switch / gear)</option>
-            <option value="value">value byte (wheel / console cluster)</option>
-          </select></div>
-        <div><label>Only these IDs (optional)</label>
-          <input id="onlyids" placeholder="0x200,0x5C1"></div>
-      </div>
-      <div class="hint">Count the number of times you physically did the action and enter it.
-        On/off doesn't matter &mdash; the tool tolerates it.</div>
-      <button id="findBtn">Find it</button>
-      <div id="findErr" class="err"></div>
-      <div id="findOut"></div>
-    </div>
+@app.post("/api/profile/validate")
+def profile_validate():
+    d = request.get_json(force=True)
+    token = d.get("token")
+    if token not in LOGS:
+        return jsonify(error="load a log first"), 400
+    profile = d.get("profile")
+    if not isinstance(profile, dict):
+        return jsonify(error="profile must be a JSON object"), 400
+    try:
+        results, score, verdict = vp.validate(LOGS[token], profile)
+    except Exception as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(
+        score=round(score, 3), verdict=verdict,
+        signals=[{"name": r.name, "role": r.role, "ok": r.ok, "detail": r.detail}
+                 for r in results],
+    )
 
-    <div id="tab-chk" class="hide">
-      <h2>Rolling counter &amp; checksum (for transmitting)</h2>
-      <div class="row"><div>
-        <label>CAN ID (blank = scan every ID)</label>
-        <input id="chkid" placeholder="0x1A0"></div></div>
-      <div class="hint">Finds the counter and cracks the checksum (sum8 / xor8 / CRC-8)
-        so a frame you transmit is accepted by the ECU.</div>
-      <button id="chkBtn">Analyze</button>
-      <div id="chkErr" class="err"></div>
-      <div id="chkOut"></div>
-    </div>
-  </div>
-</main>
-<script>
-let TOKEN=null;
-const $=s=>document.querySelector(s);
 
-$("#loadBtn").onclick=async()=>{
-  const f=$("#logfile").files[0]; const e=$("#loadErr"); e.textContent="";
-  if(!f){e.textContent="Choose a log file first.";return;}
-  const fd=new FormData(); fd.append("file",f);
-  $("#loadBtn").disabled=true; $("#loadBtn").textContent="Loading…";
-  try{
-    const r=await fetch("/api/upload",{method:"POST",body:fd}); const j=await r.json();
-    if(j.error){e.textContent=j.error;}
-    else{
-      TOKEN=j.token;
-      const idlist=j.ids.slice(0,40).map(x=>`<span class="chip mono">${x.id} · ${x.frames}f · ${x.cycle_ms}ms</span>`).join("");
-      $("#summary").classList.remove("hide");
-      $("#summary").innerHTML=`<span class="chip">${j.frames} frames</span>`+
-        `<span class="chip">${j.n_ids} IDs</span>`+idlist;
-      $("#work").style.opacity=1; $("#work").style.pointerEvents="auto";
+# ---------------------------------------------------------------------------
+# replay / immobilizer simulation  (live_decode + immobilizer)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/replay/example")
+def replay_example():
+    # live_decode uses a decode profile (signals carry "maps_to"); this is the
+    # shape replay / the immobilizer sim expect, distinct from the validate
+    # profile above.
+    return jsonify(profile=ld._TEST_PROFILE)
+
+
+@app.post("/api/replay")
+def replay():
+    d = request.get_json(force=True)
+    token = d.get("token")
+    if token not in LOGS:
+        return jsonify(error="load a log first"), 400
+    profile = d.get("profile")
+    if not isinstance(profile, dict):
+        return jsonify(error="profile must be a JSON object"), 400
+    try:
+        frames = list(ld.frames_from_log(LOGS[token]))
+    except Exception as e:
+        return jsonify(error=str(e)), 400
+
+    speeds: list[float] = []
+    gears: set[str] = set()
+    ign = 0
+    nt = 0
+    buttons: list[dict] = []
+    t0 = t1 = None
+    try:
+        for st in ld.replay_states(frames, profile):
+            nt += 1
+            if t0 is None:
+                t0 = st.t
+            t1 = st.t
+            if st.speed_kmh is not None:
+                speeds.append(st.speed_kmh)
+            if st.gear:
+                gears.add(st.gear)
+            if st.ignition_on:
+                ign += 1
+            if st.button and len(buttons) < 60:
+                buttons.append({"t": round(st.t - t0, 3), "button": st.button})
+    except Exception as e:
+        return jsonify(error=f"decode failed: {e}"), 400
+
+    base = t0 or 0.0
+    summary = {
+        "ticks": nt,
+        "span_s": round((t1 - t0), 3) if (t0 is not None and t1 is not None) else 0,
+        "speed_min": (round(min(speeds), 2) if speeds else None),
+        "speed_max": (round(max(speeds), 2) if speeds else None),
+        "gears": sorted(gears),
+        "ignition_on_ticks": ign,
+        "buttons": buttons,
     }
-  }catch(ex){e.textContent=ex;}
-  $("#loadBtn").disabled=false; $("#loadBtn").textContent="Load";
-};
+    out = {"summary": summary}
 
-document.querySelectorAll(".tabs button").forEach(b=>b.onclick=()=>{
-  document.querySelectorAll(".tabs button").forEach(x=>x.classList.remove("active"));
-  b.classList.add("active");
-  $("#tab-find").classList.toggle("hide",b.dataset.tab!=="find");
-  $("#tab-chk").classList.toggle("hide",b.dataset.tab!=="chk");
-});
+    if d.get("immobilizer"):
+        code = d.get("code")
+        if isinstance(code, str):
+            code = [c.strip() for c in code.split(",") if c.strip()]
+        code = code or []
+        inh = profile.get("inhibit", {}) or {}
+        method = {"type": inh.get("type") or inh.get("method") or "physical", **inh}
+        cfg = imo.ImmobilizerConfig(code=code, inhibit_method=method)
+        try:
+            _im, act, transitions, btns = ld.run_immobilizer(frames, profile, cfg)
+        except Exception as e:
+            return jsonify(error=f"immobilizer sim failed: {e}"), 400
+        out["immobilizer"] = {
+            "code": code,
+            "final_state": transitions[-1][1] if transitions else None,
+            "inhibit_asserted": act.asserted,
+            "transitions": [{"t": round(t - base, 3), "state": s, "info": info}
+                            for (t, s, info) in transitions][:100],
+            "actions": [{"t": round(t - base, 3), "action": a, "method": m}
+                        for (t, a, m) in act.log][:100],
+            "buttons": [{"t": round(t - base, 3), "button": b} for (t, b) in btns][:100],
+        }
+    return jsonify(**out)
 
-$("#findBtn").onclick=async()=>{
-  const e=$("#findErr"); e.textContent=""; $("#findOut").innerHTML="";
-  const body={token:TOKEN,events:$("#events").value,mode:$("#mode").value,only_ids:$("#onlyids").value};
-  $("#findBtn").disabled=true; $("#findBtn").textContent="Searching…";
-  try{
-    const r=await fetch("/api/find",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-    const j=await r.json();
-    if(j.error){e.textContent=j.error;}
-    else if(!j.candidates.length){e.textContent="No candidates. Try mode=value, or check you triggered the action during the log.";}
-    else{
-      let h=`<table><tr><th>#</th><th>CAN ID</th><th>Where</th><th>Type</th><th>start-bit</th><th>Codes</th><th>Match</th><th>Score</th></tr>`;
-      j.candidates.forEach((c,i)=>{
-        const cls=i===0?' class="top"':'';
-        h+=`<tr${cls}><td>${i+1}</td><td class="mono">${c.id}</td><td>${c.loc}</td>`+
-           `<td><span class="tag ${c.kind.split('-')[0]}">${c.kind}</span></td>`+
-           `<td class="mono">${c.start_bit}</td><td class="mono">${c.codes||'—'}</td>`+
-           `<td>${c.detail}</td>`+
-           `<td><span class="score-bar"><i style="width:${Math.max(0,Math.min(100,c.score*100))}%"></i></span> ${c.score}</td></tr>`;
-      });
-      h+="</table><div class='hint'>Top row is the best match. Confirm by re-recording with a different count.</div>";
-      $("#findOut").innerHTML=h;
+
+# ---------------------------------------------------------------------------
+# continuous signals  (find_continuous)  - the standstill-gate speed finder
+# ---------------------------------------------------------------------------
+
+@app.post("/api/continuous")
+def continuous():
+    d = request.get_json(force=True)
+    token = d.get("token")
+    if token not in LOGS:
+        return jsonify(error="load a log first"), 400
+    only = fe._parse_id_list(d.get("only_ids") or None)
+    try:
+        cands = fc.analyze(LOGS[token], reference_path=None, top=12, only_ids=only)
+    except Exception as e:
+        return jsonify(error=str(e)), 400
+    out = [{
+        "id": f"0x{c.can_id:X}", "byte": c.start_bit // 8, "width": c.width,
+        "endian": c.endian, "signed": c.signed,
+        "vmin": round(c.vmin, 1), "vmax": round(c.vmax, 1),
+        "score": round(c.score, 3), "detail": c.detail,
+    } for c in cands]
+    return jsonify(candidates=out)
+
+
+# ---------------------------------------------------------------------------
+# gear selector  (find_gears)  - the park-gate finder
+# ---------------------------------------------------------------------------
+
+@app.post("/api/gear")
+def gear():
+    d = request.get_json(force=True)
+    token = d.get("token")
+    if token not in LOGS:
+        return jsonify(error="load a log first"), 400
+    only = fe._parse_id_list(d.get("only_ids") or None)
+    try:
+        positions = int(d["positions"]) if d.get("positions") not in (None, "", "auto") else None
+    except (ValueError, TypeError):
+        positions = None
+    try:
+        cands = fg.analyze(LOGS[token], positions=positions, top=12, only_ids=only)
+    except Exception as e:
+        return jsonify(error=str(e)), 400
+    out = [{
+        "id": f"0x{c.can_id:X}", "byte": c.byte, "bit": c.bit, "width": c.width,
+        "start_bit": c.byte * 8 + c.bit,
+        "values": [f"0x{v:X}" for v in c.values],
+        "dwells": c.n_dwells, "score": round(c.score, 3), "detail": c.detail,
+    } for c in cands]
+    return jsonify(candidates=out)
+
+
+# ---------------------------------------------------------------------------
+# live capture (canlink) - connect, monitor, record -> auto-load into analysis
+#   READ-ONLY layer: listen-only by default, no TX exposed here.
+# ---------------------------------------------------------------------------
+
+CAPS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "caps")
+os.makedirs(CAPS_DIR, exist_ok=True)
+
+_bus = BusManager()
+_record: dict = {"active": False, "meta": {}}
+
+
+def _capture_filename(meta: dict) -> str:
+    """e.g. LandRover_Defender_2026_Parking_x4_20261106_143000.json."""
+    parts = [str(meta.get(k) or "").strip() for k in ("make", "model", "year")]
+    stem = "_".join([p for p in parts if p] + [str(meta.get("action") or "capture").strip() or "capture"])
+    if meta.get("count"):
+        stem += f"_x{meta['count']}"
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in stem).strip("_") or "capture"
+    return f"{safe}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+
+
+def _capture_doc(frames, meta: dict) -> dict:
+    count = meta.get("count")
+    presses = [{"label": meta.get("action") or "action"} for _ in range(count)] if count else []
+    return {
+        "type": "live",
+        "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "meta": {k: meta.get(k, "") for k in ("make", "model", "year", "action")},
+        "presses": presses,
+        "frame_count": len(frames),
+        "frames": [f.to_dict() for f in frames],
     }
-  }catch(ex){e.textContent=ex;}
-  $("#findBtn").disabled=false; $("#findBtn").textContent="Find it";
-};
 
-$("#chkBtn").onclick=async()=>{
-  const e=$("#chkErr"); e.textContent=""; $("#chkOut").innerHTML="";
-  $("#chkBtn").disabled=true; $("#chkBtn").textContent="Analyzing…";
-  try{
-    const r=await fetch("/api/checksum",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({token:TOKEN,id:$("#chkid").value.trim()})});
-    const j=await r.json();
-    if(j.error){e.textContent=j.error;}
-    else{
-      let h=`<table><tr><th>CAN ID</th><th>Counter</th><th>Checksum</th><th>Match</th></tr>`;
-      j.results.forEach(x=>{
-        const cs=x.checksum?`<span class="mono">${x.checksum}</span>`:'<span class="hint">none found</span>';
-        const m=x.checksum_match!=null?(x.confirmed?`<span class="ok">${x.checksum_match}% ✓</span>`:`<span class="bad">${x.checksum_match}%</span>`):'—';
-        h+=`<tr><td class="mono">${x.id}</td><td>${x.counters.join('<br>')||'—'}</td><td>${cs}</td><td>${m}</td></tr>`;
-      });
-      h+="</table><div class='hint'>✓ = formula reproduces the real checksum on 100% of frames.</div>";
-      $("#chkOut").innerHTML=h;
+
+@app.get("/api/live/ports")
+def live_ports():
+    return jsonify(ports=list_serial_ports())
+
+
+@app.get("/api/live/status")
+def live_status():
+    out = {"connected": _bus.connected, "recording": _record["active"]}
+    if _bus.connected:
+        st = _bus.status()
+        out.update(rx=st.get("rx"), seq=st.get("seq"),
+                   driver=(st.get("driver") or {}).get("name"))
+    return jsonify(out)
+
+
+@app.post("/api/live/connect")
+def live_connect():
+    body = request.get_json(force=True, silent=True) or {}
+    listen_only = bool(body.get("listen_only", True))
+    cfg = {
+        "driver": body.get("driver", "simulator"),
+        "bitrate": int(body.get("bitrate", 500000)),
+        "fd": bool(body.get("fd", True)),
+        "fd_channel": int(body.get("channel", 1)),
+        "fd_listen_only": listen_only,
+        "mar_channel": int(body.get("channel", 0)),
+        "mar_listen_only": listen_only,
+        "mode": "silent" if listen_only else "normal",
+        "serial_port": body.get("serial_port", ""),
+        "pythoncan_interface": body.get("pythoncan_interface", "socketcan"),
+        "pythoncan_channel": body.get("pythoncan_channel", "can0"),
     }
-  }catch(ex){e.textContent=ex;}
-  $("#chkBtn").disabled=false; $("#chkBtn").textContent="Analyze";
-};
-</script></body></html>"""
+    try:
+        if _bus.connected:
+            _bus.disconnect()
+        _bus.connect(create_driver(cfg))
+    except DriverError as e:
+        return jsonify(error=str(e)), 400
+    except Exception as e:
+        return jsonify(error=f"connect failed: {e}"), 400
+    return jsonify(ok=True, connected=True, driver=(_bus.status().get("driver") or {}))
 
+
+@app.post("/api/live/disconnect")
+def live_disconnect():
+    _record["active"] = False
+    try:
+        _bus.stop_capture()
+    except Exception:
+        pass
+    _bus.disconnect()
+    return jsonify(ok=True, connected=False)
+
+
+@app.get("/api/live/frames")
+def live_frames():
+    if not _bus.connected:
+        return jsonify(frames=[], seq=0, connected=False)
+    since = int(request.args.get("since", 0))
+    return jsonify(frames=_bus.snapshot(limit=200, since_seq=since),
+                   seq=_bus.current_seq, connected=True, recording=_record["active"])
+
+
+@app.post("/api/live/sim/trigger")
+def live_sim_trigger():
+    drv = _bus.driver
+    if drv is None or not hasattr(drv, "inject"):
+        return jsonify(error="Trigger is only available on the simulator."), 409
+    drv.inject((request.get_json(force=True, silent=True) or {}).get("event", ""))
+    return jsonify(ok=True)
+
+
+@app.post("/api/live/record/start")
+def live_record_start():
+    if not _bus.connected:
+        return jsonify(error="Connect to a bus first."), 409
+    body = request.get_json(force=True, silent=True) or {}
+    meta = {k: (body.get(k) or "") for k in ("make", "model", "year", "action")}
+    try:
+        meta["count"] = int(body["count"]) if body.get("count") not in (None, "") else None
+    except (ValueError, TypeError):
+        meta["count"] = None
+    _record["meta"] = meta
+    _bus.start_capture()
+    _record["active"] = True
+    return jsonify(ok=True, recording=True)
+
+
+@app.post("/api/live/record/stop")
+def live_record_stop():
+    if not _record["active"]:
+        return jsonify(error="Not recording."), 409
+    frames = _bus.stop_capture()
+    _record["active"] = False
+    meta = dict(_record["meta"])
+    doc = _capture_doc(frames, meta)
+    name = _capture_filename(meta)
+    # keep the file, exactly like before
+    with open(os.path.join(CAPS_DIR, name), "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    # auto-load: register as the current analysis log (no manual download/upload)
+    token = uuid.uuid4().hex[:12]
+    up_path = os.path.join(UPLOAD_DIR, f"{token}_{name}")
+    with open(up_path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    LOGS[token] = up_path
+    try:
+        nframes, nids, ids = _id_table(up_path)
+    except Exception as e:
+        return jsonify(error=f"Capture saved as {name} but could not be analyzed: {e}"), 400
+    return jsonify(ok=True, token=token, filename=name,
+                   frames=nframes, n_ids=nids, ids=ids, meta=_log_meta(up_path))
+
+
+@app.get("/api/live/download")
+def live_download():
+    path = LOGS.get(request.args.get("token", ""))
+    if not path or not os.path.exists(path):
+        return jsonify(error="unknown capture"), 404
+    name = os.path.basename(path).split("_", 1)[-1]
+    return send_file(path, as_attachment=True, download_name=name,
+                     mimetype="application/json")
+
+
+# ---------------------------------------------------------------------------
+# page
+# ---------------------------------------------------------------------------
 
 @app.get("/")
 def index():
-    return render_template_string(PAGE)
+    return render_template("index.html")
 
 
 if __name__ == "__main__":
-    print("CANSentinel UI -> http://127.0.0.1:5000  (Ctrl+C to stop)")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    import sys
+    port = int(os.environ.get("PORT", "5000"))
+    for i, a in enumerate(sys.argv[1:], 1):
+        if a == "--port" and i + 1 < len(sys.argv):
+            port = int(sys.argv[i + 1])
+        elif a.isdigit():
+            port = int(a)
+    print(f"CANSentinel UI -> http://127.0.0.1:{port}  (read-only; Ctrl+C to stop)")
+    app.run(host="127.0.0.1", port=port, debug=False)

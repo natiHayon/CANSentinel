@@ -34,11 +34,20 @@ Three ways to tell it what you did (pick one)
                         active here but idle in the baseline are the candidates.
                         Combine with (A)/(B) for the strongest result.
 
+Human-cadence filter (always on)
+--------------------------------
+  Candidates whose activations repeat faster than a person plausibly performs
+  the action - a rolling counter or periodic status word firing every few
+  hundred ms - are downranked (or dropped with --drop-implausible). Tune the
+  window with --min-gap (hard floor) and --settle-gap (fully-human spacing).
+
 Supported log formats (auto-detected)
 -------------------------------------
   * webCAN / CANsub CSV  (TimestampEpoch;BusChannel;ID;...;DataBytes)
   * candump (Linux SocketCAN):   (1700000000.123456) can0 123#DEADBEEF
   * generic delimited:   <epoch><sep><id-hex><sep><data-hex>   (sep = ; , or space)
+  * JSON capture:        {"frames":[{ts|timestamp, id|id_hex, data|data_hex}, ...]}
+                         (also a bare list, or JSON-lines; RX frames only)
 
 Examples
 --------
@@ -58,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 import sys
 from dataclasses import dataclass, field
@@ -91,25 +101,141 @@ def _parse_hex_id(s: str) -> int:
 def load_log(path: str) -> list[Frame]:
     """Load a CAN log in any of the supported formats into a time-sorted list."""
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        lines = [ln.rstrip("\n") for ln in fh]
-    lines = [ln for ln in lines if ln.strip()]
-    if not lines:
-        raise ValueError(f"{path}: empty log")
+        raw = fh.read()
 
-    first = lines[0]
     frames: list[Frame]
-
-    if first.startswith(WEBCAN_HEADER):
-        frames = _load_webcan(lines)
-    elif _CANDUMP_RE.match(first):
-        frames = _load_candump(lines)
+    if raw.lstrip().startswith(("{", "[")):
+        frames = _load_json(raw, path)
     else:
-        frames = _load_generic(lines)
+        lines = [ln for ln in raw.splitlines() if ln.strip()]
+        if not lines:
+            raise ValueError(f"{path}: empty log")
+        first = lines[0]
+        if first.startswith(WEBCAN_HEADER):
+            frames = _load_webcan(lines)
+        elif _CANDUMP_RE.match(first):
+            frames = _load_candump(lines)
+        else:
+            frames = _load_generic(lines)
 
     if not frames:
         raise ValueError(f"{path}: no frames parsed (unrecognized format?)")
     frames.sort(key=lambda f: f.t)
     return frames
+
+
+def _json_ts(r: dict) -> float | None:
+    for k in ("ts", "timestamp", "source_timestamp", "time"):
+        v = r.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _json_id(r: dict) -> int | None:
+    for k in ("id", "can_id", "arbitration_id", "id_hex"):
+        v = r.get(k)
+        if v is None or isinstance(v, bool):
+            continue
+        if isinstance(v, int):
+            return v
+        s = str(v).strip()
+        if not s:
+            continue
+        # id_hex or an "0x.." string is hex; a bare string may be decimal or hex
+        try:
+            return int(s, 16) if (k == "id_hex" or s.lower().startswith("0x")) \
+                else int(s, 0)
+        except ValueError:
+            try:
+                return int(s, 16)
+            except ValueError:
+                continue
+    return None
+
+
+def _json_data(r: dict) -> bytes | None:
+    for k in ("data", "data_hex", "bytes", "payload"):
+        v = r.get(k)
+        if v is None:
+            continue
+        if isinstance(v, (list, tuple)):
+            try:
+                return bytes(int(b) & 0xFF for b in v)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(v, str):
+            try:
+                return bytes.fromhex(v.replace(" ", "").replace(":", ""))
+            except ValueError:
+                continue
+    return None
+
+
+def _parse_jsonl(raw: str, path: str) -> list:
+    """Parse JSON-lines: one JSON frame object per line (optionally inside []).."""
+    recs = []
+    for ln in raw.splitlines():
+        ln = ln.strip().rstrip(",")
+        if not ln or ln in ("[", "]"):
+            continue
+        try:
+            recs.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    if not recs:
+        raise ValueError(f"{path}: not valid JSON or JSON-lines")
+    return recs
+
+
+def _load_json(raw: str, path: str = "<json>") -> list[Frame]:
+    """Load a JSON capture (any of the project's CAN reader exports).
+
+    Accepts a dict with a "frames" list, a bare list of frame objects, or
+    JSON-lines (one frame object per line). Field names and encodings vary
+    between reader versions, so each frame is read tolerantly:
+
+      * time : ts | timestamp | source_timestamp | time
+      * id   : id | can_id | arbitration_id | id_hex  (int, or hex string "0x..")
+      * data : data | data_hex | bytes | payload  (int list, or hex string)
+
+    Only receive frames are kept: transmit echoes (``dir`` tx/out/1) and
+    remote-request frames (``rtr``) are dropped, so the loader stays
+    read-only-safe. Any metadata outside "frames" (make/model/presses) is
+    ignored.
+    """
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        doc = _parse_jsonl(raw, path)
+
+    if isinstance(doc, dict):
+        records = doc.get("frames")
+        if records is None:
+            raise ValueError(f"{path}: JSON object has no 'frames' list")
+    elif isinstance(doc, list):
+        records = doc
+    else:
+        raise ValueError(f"{path}: unrecognized JSON log shape")
+
+    out: list[Frame] = []
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        if str(r.get("dir", "")).strip().lower() in ("tx", "t", "1", "out"):
+            continue  # skip TX echoes; keep RX
+        if r.get("rtr"):
+            continue  # remote-request frame carries no data payload
+        t = _json_ts(r)
+        cid = _json_id(r)
+        payload = _json_data(r)
+        if t is None or cid is None or payload is None:
+            continue
+        out.append(Frame(t, cid, payload))
+    return out
 
 
 def _load_webcan(lines: list[str]) -> list[Frame]:
@@ -450,6 +576,46 @@ def score_by_times(c: Candidate, events: np.ndarray, tol: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Human-cadence plausibility
+# ---------------------------------------------------------------------------
+
+_CADENCE_FLOOR_PENALTY = 0.15  # score retained by an implausibly-fast candidate
+
+
+def cadence_factor(
+    edge_times: np.ndarray, min_gap: float, settle_gap: float
+) -> tuple[float, float]:
+    """How plausible is this candidate's repeat rate for a *human* action?
+
+    A person triggering a control N times leaves clear, human-scale rests
+    between activations. A rolling counter, periodic status word, or other
+    "something the car just does" fires on a fast, machine-regular beat. We key
+    on the *onset-to-onset* spacing (ignoring how briefly each pulse is held, so
+    a clean 80 ms button pulse is judged by the ~1 s between presses, not its
+    width):
+
+      * smallest onset gap >= ``settle_gap``  -> 1.0   (clearly human-spaced)
+      * smallest onset gap <= ``min_gap``      -> floor (faster than a person can
+        deliberately repeat the action -> almost certainly machine traffic)
+      * in between                              -> linear ramp
+
+    Returns ``(factor, min_onset_gap)``. With fewer than two activations there
+    is no cadence to judge, so the factor is a neutral 1.0 and the gap is inf.
+    """
+    onsets = np.sort(np.asarray(edge_times, dtype=np.float64))
+    if onsets.size < 2:
+        return 1.0, float("inf")
+    g = float(np.min(np.diff(onsets)))
+    if g >= settle_gap:
+        return 1.0, g
+    if g <= min_gap:
+        return _CADENCE_FLOOR_PENALTY, g
+    span = settle_gap - min_gap
+    frac = (g - min_gap) / span if span > 0 else 0.0
+    return _CADENCE_FLOOR_PENALTY + (1.0 - _CADENCE_FLOOR_PENALTY) * frac, g
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -477,6 +643,9 @@ def analyze(
     only_ids: set[int] | None,
     exclude_ids: set[int] | None,
     top: int,
+    min_gap: float = 0.30,
+    settle_gap: float = 1.0,
+    drop_implausible: bool = False,
 ) -> list[Candidate]:
     frames = load_log(trace)
     series = build_series(frames)
@@ -513,6 +682,7 @@ def analyze(
         want = {"pulse": "pulse-bit", "toggle": "toggle-bit", "value": "value-byte"}[mode]
         all_cands = [c for c in all_cands if c.kind == want]
 
+    kept: list[Candidate] = []
     for c in all_cands:
         if events is not None:
             score_by_times(c, events, tol)
@@ -523,8 +693,19 @@ def analyze(
             c.score = (1.0 - min(c.activity_frac, 1.0)) / (1.0 + abs(c.count - 1))
             c.detail = f"{c.count} activations, active {c.activity_frac*100:.1f}% of frames"
 
-    all_cands.sort(key=lambda c: c.score, reverse=True)
-    return all_cands[:top]
+        # human-cadence plausibility: a rolling counter / periodic status word
+        # repeats far faster than a person performs a discrete action, so a
+        # candidate firing below human cadence is downranked (or dropped).
+        factor, gap = cadence_factor(c.edge_times, min_gap, settle_gap)
+        if drop_implausible and np.isfinite(gap) and gap < min_gap:
+            continue  # faster than any human action -> machine traffic, drop it
+        c.score *= factor
+        if factor < 0.999 and np.isfinite(gap):
+            c.detail += f"; fast cadence {gap:.2f}s (x{factor:.2f})"
+        kept.append(c)
+
+    kept.sort(key=lambda c: c.score, reverse=True)
+    return kept[:top]
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +807,18 @@ def _selftest() -> int:
     if c:
         print(f"         decoded button codes: {[hex(v) for v in c[0].active_values]}")
 
+    print("\n[selftest] CADENCE plausibility (human vs machine onset spacing):")
+    human = np.array([0.0, 1.2, 2.4, 3.6])    # ~1.2s apart: deliberate presses
+    medium = np.array([0.0, 0.4, 0.8, 1.2])   # 0.4s beat: too fast to be natural
+    machine = np.array([0.0, 0.1, 0.2, 0.3])  # 0.1s beat: rolling/status traffic
+    fh = cadence_factor(human, 0.30, 1.0)[0]
+    fm = cadence_factor(medium, 0.30, 1.0)[0]
+    fx = cadence_factor(machine, 0.30, 1.0)[0]
+    cad_ok = (fh == 1.0 and fm < 0.8 and fx <= _CADENCE_FLOOR_PENALTY + 1e-9)
+    print(f"  {'PASS' if cad_ok else 'FAIL'} cadence: human x{fh:.2f}, "
+          f"0.4s-beat x{fm:.2f}, 0.1s-beat x{fx:.2f}")
+    ok &= cad_ok
+
     print("\n[selftest]", "ALL PASSED" if ok else "SOME FAILED")
     return 0 if ok else 1
 
@@ -658,6 +851,18 @@ def main(argv=None) -> int:
     ap.add_argument("--only-ids", help="comma list of IDs to consider, e.g. 0x200,0x5C1")
     ap.add_argument("--exclude-ids", help="comma list of IDs to skip")
     ap.add_argument("--top", type=int, default=10, help="how many candidates to print")
+    ap.add_argument("--min-gap", type=float, default=0.30,
+                    help="fastest plausible gap (s) between repeats of a human "
+                         "action; onsets faster than this are treated as machine "
+                         "traffic (rolling counters, status beats) and crushed "
+                         "(default 0.30)")
+    ap.add_argument("--settle-gap", type=float, default=1.0,
+                    help="onset gap (s) at/above which cadence is fully "
+                         "human-plausible; between this and --min-gap the score "
+                         "ramps down (default 1.0)")
+    ap.add_argument("--drop-implausible", action="store_true",
+                    help="remove (not just downrank) candidates whose repeat rate "
+                         "is faster than --min-gap")
     ap.add_argument("--selftest", action="store_true",
                     help="synthesize a bus with planted signals and verify recovery")
     args = ap.parse_args(argv)
@@ -679,6 +884,9 @@ def main(argv=None) -> int:
         only_ids=_parse_id_list(args.only_ids),
         exclude_ids=_parse_id_list(args.exclude_ids),
         top=args.top,
+        min_gap=args.min_gap,
+        settle_gap=args.settle_gap,
+        drop_implausible=args.drop_implausible,
     )
 
     if not cands:
