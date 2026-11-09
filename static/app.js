@@ -104,6 +104,7 @@ $("#lvConnect").onclick = async () => {
     const j = await postJSON("/api/live/connect", {
       driver: $("#lvDriver").value, bitrate: $("#lvBitrate").value,
       channel: $("#lvChannel").value, listen_only: $("#lvListen").checked,
+      serial_port: $("#lvPort").value,
     });
     if (j.error) { err.textContent = j.error; }
     else {
@@ -123,6 +124,21 @@ $("#lvDisconnect").onclick = async () => {
   $("#lvStatus").textContent = "not connected"; $("#lvStatus").className = "badge muted";
   $("#lvSim").hidden = true;
 };
+async function lvLoadPorts() {
+  try {
+    const r = await fetch("/api/live/ports"); const j = await r.json();
+    const sel = $("#lvPort"); const cur = sel.value;
+    sel.innerHTML = "<option value=''>(none)</option>" +
+      (j.ports || []).map((p) => "<option value='" + esc(p.device) + "'>" + esc(p.device) +
+        (p.description ? " — " + esc(p.description) : "") + "</option>").join("");
+    sel.value = cur;
+    if (!(j.ports || []).length) {
+      sel.innerHTML = "<option value=''>(no serial ports — install pyserial / check the reader)</option>";
+    }
+  } catch (ex) { /* ignore */ }
+}
+$("#lvPorts").onclick = lvLoadPorts;
+lvLoadPorts();
 $$(".lvsim").forEach((b) => b.onclick = () => postJSON("/api/live/sim/trigger", { event: b.dataset.ev }));
 $("#rvStart").onclick = async () => {
   const err = $("#lvErr"); err.textContent = "";

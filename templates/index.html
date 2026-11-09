@@ -64,14 +64,18 @@
           <option value="125000">125 kbit/s</option>
         </select>
       </label>
-      <label>Channel <span class="hint">adapter ch</span>
+      <label>Channel <span class="hint">USB-CAN-FD ch</span>
         <input id="lvChannel" type="number" value="1" min="0">
+      </label>
+      <label>Serial port <span class="hint">USB-CAN-A</span>
+        <select id="lvPort"><option value="">(none)</option></select>
       </label>
       <label class="check"><input id="lvListen" type="checkbox" checked> Listen-only (safe)</label>
     </div>
     <div class="row">
       <button id="lvConnect" class="primary">Connect</button>
       <button id="lvDisconnect">Disconnect</button>
+      <button id="lvPorts">&#8635; Ports</button>
       <span id="lvStatus" class="badge muted">not connected</span>
     </div>
     <div id="lvErr" class="err"></div>
